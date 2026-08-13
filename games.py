@@ -1,4 +1,4 @@
-# app.py – Unified Chameleon + Bluff (Fixed Bugs & Improved UI)
+# app.py – Unified Chameleon + Bluff (Critical Fixes for Chameleon Flow)
 from flask import Flask, render_template_string, jsonify, request, session
 import random
 import string
@@ -8,9 +8,22 @@ import html
 import threading
 import os
 from functools import wraps
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'unified_secret_key_change_in_production')
+
+# ---------- SECURITY HOOKS ----------
+@app.before_request
+def csrf_mitigation():
+    """Basic CSRF protection by validating the Referer header on state-changing requests."""
+    if request.method == "POST":
+        referer = request.headers.get('Referer')
+        if referer:
+            ref_url = urlparse(referer)
+            host_url = urlparse(request.host_url)
+            if ref_url.netloc != host_url.netloc:
+                return jsonify({'error': 'CSRF token missing or incorrect origin'}), 403
 
 # ---------- GLOBAL CHAT ----------
 GLOBAL_CHAT_MESSAGES = []
@@ -122,10 +135,19 @@ def generate_room_id():
 
 def log_room_action(room, msg):
     timestamp = time.strftime("%H:%M:%S")
+    # Sanitize inputs dynamically while preserving intent
+    safe_msg = html.escape(msg)
     with ROOMS_LOCK:
-        room['game_log'].append(f"[{timestamp}] {msg}")
+        room['game_log'].append(f"[{timestamp}] {safe_msg}")
         if len(room['game_log']) > 50:
             room['game_log'].pop(0)
+
+def remove_player_and_manuals(room, target_id):
+    """Safely cascades the removal of a player and any of their connected manual players."""
+    to_remove = [pid for pid, p in room['players'].items() if pid == target_id or p.get('device_id') == target_id]
+    for pid in to_remove:
+        if pid in room['players']:
+            del room['players'][pid]
 
 # ---------- GAME SETUPS ----------
 def setup_new_online_round(room, category=None):
@@ -202,7 +224,6 @@ def check_bluff_vote(room):
     active_players = [p for p in room['players'] if not room['players'][p].get('is_manual')]
     total = len(active_players)
     
-    # FIXED: Check if all active players have voted
     if len(votes) >= total:
         room['voting']['active'] = False
         end_votes = sum(1 for v in votes.values() if v == 'end')
@@ -213,16 +234,19 @@ def check_bluff_vote(room):
             room['phase'] = 'BLUFF_FINISHED'
             log_room_action(room, f"🏆 {room['players'][target]['name']} wins the round!")
         else:
-            # Player continues without cards
             if target in room['turn_order']:
                 idx = room['turn_order'].index(target)
                 room['turn_order'].remove(target)
                 log_room_action(room, f"➡️ {room['players'][target]['name']} is out of cards and continues watching.")
                 if len(room['turn_order']) > 0:
-                    room['current_turn_index'] = (idx - 1) % len(room['turn_order'])
+                    # FIX: Safely compute and lock the next valid player index without double-advancing
+                    room['current_turn_index'] = idx % len(room['turn_order'])
+                    while len(room['players'][room['turn_order'][room['current_turn_index']]]['cards']) == 0:
+                        room['current_turn_index'] = (room['current_turn_index'] + 1) % len(room['turn_order'])
+            else:
+                next_bluff_turn(room)
             
             room['phase'] = 'BLUFF_PLAYING'
-            next_bluff_turn(room)
         room['last_activity'] = time.time()
 
 # ---------- BACKGROUND THREAD ----------
@@ -376,43 +400,47 @@ def online_list_games():
 @app.route('/online/create_game', methods=['POST'])
 def online_create_game():
     player_id = session.get('player_id')
-    name = request.json.get('name', 'Host').strip()[:12] or 'Host'
+    # Sanitization applied
+    name = html.escape(request.json.get('name', 'Host').strip()[:12] or 'Host')
     room_id = generate_room_id()
     
+    room_data = {
+        'host_id': player_id,
+        'phase': 'LOBBY',
+        'game_type': 'chameleon',
+        'game_log': [],
+        'players': {player_id: {'name': name, 'is_host': True, 'is_manual': False}},
+        'roles': {},
+        'player_codes': {},
+        'votes': {},
+        'topic_name': '',
+        'grid': [],
+        'chameleon_id': None,
+        'secret_word': '',
+        'col': '',
+        'row': 0,
+        'created_at': time.time(),
+        'use_codes': True,
+        'last_activity': time.time(),
+        'keep_until': 0,
+        'revealed_players': set(),
+        # Bluff states
+        'turn_order': [],
+        'current_turn_index': 0,
+        'discard_pile': [],
+        'played_cards': [],
+        'last_played_cards': [], 
+        'claimed_rank': '',
+        'played_by': None,
+        'consecutive_passes': 0,
+        'winner': None,
+        'voting': {'active': False, 'votes': {}, 'target': None}
+    }
+    
     with ROOMS_LOCK:
-        ROOMS[room_id] = {
-            'host_id': player_id,
-            'phase': 'LOBBY',
-            'game_type': 'chameleon',
-            'game_log': [],
-            'players': {player_id: {'name': name, 'is_host': True, 'is_manual': False}},
-            'roles': {},
-            'player_codes': {},
-            'votes': {},
-            'topic_name': '',
-            'grid': [],
-            'chameleon_id': None,
-            'secret_word': '',
-            'col': '',
-            'row': 0,
-            'created_at': time.time(),
-            'use_codes': True,
-            'last_activity': time.time(),
-            'keep_until': 0,
-            'revealed_players': set(),
-            # Bluff states
-            'turn_order': [],
-            'current_turn_index': 0,
-            'discard_pile': [],
-            'played_cards': [],
-            'last_played_cards': [], 
-            'claimed_rank': '',
-            'played_by': None,
-            'consecutive_passes': 0,
-            'winner': None,
-            'voting': {'active': False, 'votes': {}, 'target': None}
-        }
+        ROOMS[room_id] = room_data
         log_room_action(ROOMS[room_id], f"Room created by {name}")
+    
     return jsonify({'room_id': room_id, 'is_host': True})
 
 @app.route('/online/set_game', methods=['POST'])
@@ -449,7 +477,7 @@ def online_request_gamemode():
 @app.route('/online/join_game', methods=['POST'])
 def online_join_game():
     player_id = session.get('player_id')
-    name = request.json.get('name', 'Player').strip()[:12] or 'Player'
+    name = html.escape(request.json.get('name', 'Player').strip()[:12] or 'Player')
     room_id = request.json.get('room_id')
     
     with ROOMS_LOCK:
@@ -469,7 +497,7 @@ def online_join_game():
 def online_add_manual_player():
     room_id = request.json.get('room_id')
     player_id = session.get('player_id')
-    name = request.json.get('name', 'Player').strip()[:12] or 'Player'
+    name = html.escape(request.json.get('name', 'Player').strip()[:12] or 'Player')
     device_id = request.json.get('device_id', player_id)
     
     with ROOMS_LOCK:
@@ -498,7 +526,8 @@ def online_remove_player():
             return jsonify({'error': 'Player not found'}), 404
         
         p_name = room['players'][target_id]['name']
-        del room['players'][target_id]
+        remove_player_and_manuals(room, target_id)
+        
         room['last_activity'] = time.time()
         log_room_action(room, f"🚪 {p_name} was removed.")
         
@@ -509,11 +538,11 @@ def online_remove_player():
 @app.route('/online/keep_room', methods=['POST'])
 def online_keep_room():
     room_id = request.json.get('room_id')
-    room = ROOMS.get(room_id)
-    if room and session.get('player_id') == room['host_id']:
-        with ROOMS_LOCK:
+    with ROOMS_LOCK:
+        room = ROOMS.get(room_id)
+        if room and session.get('player_id') == room['host_id']:
             room['keep_until'] = time.time() + ROOM_KEEP_ALIVE
-        return jsonify({'success': True})
+            return jsonify({'success': True})
     return jsonify({'error': 'Unauthorized'}), 403
 
 @app.route('/online/leave_room', methods=['POST'])
@@ -525,13 +554,16 @@ def online_leave_room():
         room = ROOMS.get(room_id)
         if not room:
             return jsonify({'success': False, 'error': 'Room not found'})
+            
         if player_id == room['host_id']:
             del ROOMS[room_id]
             return jsonify({'success': True, 'disbanded': True})
+            
         if player_id in room['players']:
-            del room['players'][player_id]
+            remove_player_and_manuals(room, player_id)
             if room['phase'] not in ['LOBBY', 'WAITING_DEVICE_SETUP']:
                 room['phase'] = 'LOBBY'
+                
     return jsonify({'success': True, 'disbanded': False})
 
 @app.route('/online/toggle_codes', methods=['POST'])
@@ -657,14 +689,20 @@ def online_start_game():
 def online_reveal_role():
     room_id = request.json.get('room_id')
     target_id = request.json.get('target_id')
+    player_id = session.get('player_id')
     
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if not room or room['phase'] != 'ROLE_REVEAL':
             return jsonify({'error': 'Invalid phase'}), 400
         
-        if target_id not in room['players']:
+        target_player = room['players'].get(target_id)
+        if not target_player:
             return jsonify({'error': 'Invalid target'}), 400
+            
+        # Security Auth check
+        if target_id != player_id and target_player.get('device_id') != player_id:
+            return jsonify({'error': 'Unauthorized to reveal this role'}), 403
             
         if target_id in room.get('revealed_players', set()):
             return jsonify({'error': 'Already revealed'}), 400
@@ -673,7 +711,7 @@ def online_reveal_role():
         return jsonify({
             'is_chameleon': (room['roles'][target_id] == 'CHAMELEON'),
             'code': room['player_codes'][target_id],
-            'player_name': room['players'][target_id]['name']
+            'player_name': target_player['name']
         })
 
 @app.route('/online/player_done', methods=['POST'])
@@ -694,6 +732,7 @@ def online_player_done():
 def online_verify_code():
     data = request.json
     room_id = data.get('room_id')
+    player_id = session.get('player_id')
     
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
@@ -709,8 +748,14 @@ def online_verify_code():
             return jsonify({'valid': False})
         else:
             tgt = data.get('player_id')
-            if tgt not in room['players']:
+            tgt_player = room['players'].get(tgt)
+            if not tgt_player:
                 return jsonify({'valid': False})
+                
+            # Security Auth check for manual mode
+            if tgt != player_id and tgt_player.get('device_id') != player_id:
+                return jsonify({'valid': False})
+                
             is_cham = (room['roles'][tgt] == 'CHAMELEON')
             return jsonify({'valid': True, 'is_chameleon': is_cham, 'col': room['col'], 'row': room['row']})
 
@@ -720,13 +765,17 @@ def online_change_topic():
     room_id = data.get('room_id')
     req_type = data.get('type')
     topic_name = data.get('topic')
+    player_id = session.get('player_id')
     
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if not room:
             return jsonify({'error': 'Room not found'}), 404
+            
+        # Security Auth Check: Host privilege
+        if room['host_id'] != player_id:
+            return jsonify({'error': 'Only the host can change the topic'}), 403
         
-        # FIXED: Validate topic
         if req_type == 'random' or not topic_name or topic_name not in TOPIC_CARDS:
             topic_name = random.choice(list(TOPIC_CARDS.keys()))
         
@@ -754,13 +803,21 @@ def online_cast_vote():
     room_id = data.get('room_id')
     voter_id = data.get('voter_id')
     target_id = data.get('target_id')
+    player_id = session.get('player_id')
     
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if not room:
             return jsonify({'error': 'Room not found'}), 404
+            
+        voter_player = room['players'].get(voter_id)
+        if not voter_player:
+            return jsonify({'error': 'Invalid voter'}), 400
+            
+        # Security Auth check
+        if voter_id != player_id and voter_player.get('device_id') != player_id:
+             return jsonify({'error': 'Unauthorized to cast this vote'}), 403
         
-        # FIXED: Prevent duplicate votes
         if voter_id in room['votes']:
             return jsonify({'error': 'Already voted'}), 400
         
@@ -790,6 +847,7 @@ def online_restart():
         if room:
             room['phase'] = 'LOBBY'
             room['revealed_players'] = set()
+            room['votes'] = {}
     return jsonify({'success': True})
 
 # --- BLUFF ACTIONS ---
@@ -935,7 +993,6 @@ def online_bluff_action():
             return jsonify({'success': True})
 
         elif action == 'vote':
-            # FIXED: Validate voting
             if room['phase'] != 'BLUFF_VOTING' or not room['voting']['active']:
                 return jsonify({'error': 'Voting not active'}), 400
             if pid not in room['players'] or room['players'][pid].get('is_manual'):
@@ -1123,7 +1180,7 @@ HTML_TEMPLATE = """
         <button class="btn" style="background:#475569; margin-top:10px;" onclick="leaveOnlineGame()">🚪 Leave</button>
     </div>
 
-    <!-- ONLINE CHAMELEON -->
+    <!-- ONLINE CHAMELEON ROLE REVEAL -->
     <div id="screen-online-roles" class="screen">
         <h3 id="online-player-turn-header" style="color: var(--accent);"></h3>
         <button id="online-reveal-role-btn" class="btn" onclick="revealOnlineRole()">👁️ Show Secret Role</button>
@@ -1168,7 +1225,7 @@ HTML_TEMPLATE = """
         <div id="bluff-hand"></div>
         <div id="bluff-controls" style="margin-top:15px;"></div>
         <div id="bluff-voting" style="display:none; margin-top:15px; background:rgba(245,158,11,0.2); padding:10px; border-radius:10px;">
-            <p style="color:var(--warning);">Empty hand! End game or Continue?</p>
+            <p id="bluff-voting-text" style="color:var(--warning);"></p>
             <button class="btn btn-success" onclick="voteBluff('end')">🏆 End Round</button>
             <button class="btn" onclick="voteBluff('continue')" style="background:#475569;">➡️ Continue</button>
         </div>
@@ -1214,7 +1271,7 @@ function sendChat() {
     const text = input.value.trim();
     if (!text) return;
     if (!chatUsername) {
-        chatUsername = prompt("Username:") || "Anonymous";
+        chatUsername = prompt("Enter Your REAL NAME:") || "Anonymous";
         localStorage.setItem('chatUsername', chatUsername);
     }
     fetch('/global_chat/send', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({username: chatUsername, text}) }).then(() => { input.value = ''; loadChat(); });
@@ -1347,23 +1404,21 @@ function renderGrid(tableId, targetCol, targetRow) {
 
 // --- TOPIC MODAL ---
 function openTopicModal(prefix) {
-    fetch('/').then(r => r.text()).then(html => {
-        const topicNames = Object.keys({{ topics|tojson }});
-        const modal = document.createElement('div');
-        modal.className = 'modal-overlay';
-        modal.innerHTML = `
-            <div class="modal-content">
-                <h3>🔀 Change Topic</h3>
-                <p style="color:var(--text-muted); font-size:14px;">Select a topic or use random:</p>
-                <button class="btn btn-topic" onclick="changeTopic('${prefix}', 'random'); this.closest('.modal-overlay').remove();">🎲 Random Topic</button>
-                <div class="topic-grid">
-                    ${topicNames.map(t => `<div class="topic-item" onclick="changeTopic('${prefix}', '${t}'); this.closest('.modal-overlay').remove();">${t}</div>`).join('')}
-                </div>
-                <button class="btn" style="background:#475569;" onclick="this.closest('.modal-overlay').remove();">Cancel</button>
+    const topicNames = {{ topics|tojson }};
+    const modal = document.createElement('div');
+    modal.className = 'modal-overlay';
+    modal.innerHTML = `
+        <div class="modal-content">
+            <h3>🔀 Change Topic</h3>
+            <p style="color:var(--text-muted); font-size:14px;">Select a topic or use random:</p>
+            <button class="btn btn-topic" onclick="changeTopic('${prefix}', 'random'); this.closest('.modal-overlay').remove();">🎲 Random Topic</button>
+            <div class="topic-grid">
+                ${topicNames.map(t => `<div class="topic-item" onclick="changeTopic('${prefix}', '${t}'); this.closest('.modal-overlay').remove();">${t}</div>`).join('')}
             </div>
-        `;
-        document.body.appendChild(modal);
-    });
+            <button class="btn" style="background:#475569;" onclick="this.closest('.modal-overlay').remove();">Cancel</button>
+        </div>
+    `;
+    document.body.appendChild(modal);
 }
 
 function changeTopic(prefix, type) {
@@ -1383,8 +1438,9 @@ function changeTopic(prefix, type) {
 
 // --- ONLINE MULTIPLAYER ---
 let currentRoom = null, isHost = false, myPlayerId = null, pollInterval = null;
-let selectedBluffCards = [], lastControlsHTML = '';
+let selectedBluffCards = [];
 window.currentRevealId = null;
+window.prevHandLength = 0;
 
 function refreshOnlineGames() {
     fetch('/online/list_games').then(r => r.json()).then(games => {
@@ -1446,6 +1502,8 @@ function updateElementIfChanged(element, newHtml) {
     return false;
 }
 
+let roleRevealed = false;
+
 function onlinePollState() {
     fetch(`/online/room_state?room=${currentRoom}`).then(r => r.json()).then(data => {
         if (data.error) { goToLanding(); return; }
@@ -1454,6 +1512,7 @@ function onlinePollState() {
         window.onlineUseCodes = data.use_codes;
 
         if (data.phase === 'LOBBY') {
+            roleRevealed = false;
             updateLogBox('online-game-log', data.game_log);
             showScreen('screen-online-lobby');
             document.getElementById('host-game-settings').style.display = isHost ? 'block' : 'none';
@@ -1491,6 +1550,7 @@ function onlinePollState() {
             }
         } 
         else if (data.phase.startsWith('BLUFF_')) {
+            roleRevealed = false;
             showScreen('screen-online-bluff');
             updateLogBox('bluff-game-log', data.game_log);
             renderBluffGame(data);
@@ -1498,19 +1558,22 @@ function onlinePollState() {
         else { // Chameleon
             if (data.phase === 'ROLE_REVEAL') {
                 showScreen('screen-online-roles');
-                if (data.already_revealed) {
+                
+                if (!roleRevealed && !data.already_revealed) {
+                    window.currentRevealId = data.current_reveal_id;
+                    document.getElementById('online-player-turn-header').innerText = `${data.current_reveal_name}'s Turn`;
+                    document.getElementById('online-reveal-role-btn').style.display = 'block';
+                    document.getElementById('online-role-details').style.display = 'none';
+                } else if (roleRevealed) {
+                    document.getElementById('online-reveal-role-btn').style.display = 'none';
+                    document.getElementById('online-role-details').style.display = 'block';
+                } else {
                     document.getElementById('online-player-turn-header').innerText = `Done. Waiting for others...`;
                     document.getElementById('online-reveal-role-btn').style.display = 'none';
                     document.getElementById('online-role-details').style.display = 'none';
-                } else {
-                    window.currentRevealId = data.current_reveal_id;
-                    document.getElementById('online-player-turn-header').innerText = `${data.current_reveal_name}'s Turn`;
-                    
-                    if (document.getElementById('online-role-details').style.display === 'none') {
-                        document.getElementById('online-reveal-role-btn').style.display = 'block';
-                    }
                 }
             } else if (data.phase === 'PLAYING') {
+                roleRevealed = false;
                 showScreen('screen-online-grid');
                 updateLogBox('online-chameleon-log', data.game_log);
                 document.getElementById('online-topic-title').innerText = data.topic_name;
@@ -1527,11 +1590,13 @@ function onlinePollState() {
                     document.getElementById('online-viewer-select').innerHTML = data.device_players.map(p => `<option value="${p.id}">${p.name}</option>`).join(''); 
                 }
             } else if (data.phase === 'VOTING') {
+                roleRevealed = false;
                 showScreen('screen-online-voting');
                 document.getElementById('vote-as-select').innerHTML = data.device_players.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
                 document.getElementById('vote-targets').innerHTML = data.players.map(p => `<button class="btn btn-option" onclick="castOnlineVote('${p.id}')">${p.name}</button>`).join('');
                 document.getElementById('btn-end-voting').style.display = isHost ? 'block' : 'none';
             } else if (data.phase === 'RESULTS') {
+                roleRevealed = false;
                 showScreen('screen-online-voting');
                 let html = `<h3 style="color:var(--success);">Word: ${data.secret_word}</h3>`;
                 html += `<h4 style="color:var(--warning);">Chameleon: ${data.chameleon_name}</h4>`;
@@ -1547,22 +1612,26 @@ function onlinePollState() {
 function revealOnlineRole() {
     fetch('/online/reveal_role', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom, target_id: window.currentRevealId}) }).then(r=>r.json()).then(data => {
         if (data.error) { showToast(data.error); return; }
+        roleRevealed = true;
         document.getElementById('online-reveal-role-btn').style.display = 'none';
         document.getElementById('online-role-details').style.display = 'block';
         document.getElementById('online-assigned-code').innerText = data.code;
         document.getElementById('online-role-alert-box').innerHTML = data.is_chameleon ? '<span style="color:var(--warning)">You are the CHAMELEON</span>' : '<span style="color:var(--accent)">You are Clued-In</span>';
     });
 }
+
 function nextOnlinePlayer() { 
+    roleRevealed = false;
     document.getElementById('online-role-details').style.display = 'none';
     fetch('/online/player_done', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom}) }).then(() => onlinePollState());
 }
+
 function verifyOnlineCode() {
     let payload = { room_id: currentRoom };
     if (window.onlineUseCodes) payload.code = document.getElementById('online-player-code-input').value;
     else payload.player_id = document.getElementById('online-viewer-select').value;
     fetch('/online/verify_code', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) }).then(r=>r.json()).then(data => {
-        if (!data.valid) { showToast("Invalid code."); return; }
+        if (!data.valid) { showToast("Invalid code or unauthorized."); return; }
         document.getElementById('online-code-input-area').style.display = 'none';
         document.getElementById('online-no-code-area').style.display = 'none';
         document.getElementById('online-decrypted-info').style.display = 'block';
@@ -1575,12 +1644,14 @@ function verifyOnlineCode() {
         }
     });
 }
+
 function resetOnlineGrid() {
     document.getElementById('online-decrypted-info').style.display = 'none';
     if(window.onlineUseCodes) document.getElementById('online-code-input-area').style.display = 'block';
     else document.getElementById('online-no-code-area').style.display = 'block';
     document.getElementById('online-player-code-input').value = '';
 }
+
 function startOnlineVoting() { fetch('/online/start_voting_phase', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom}) }); }
 function castOnlineVote(targetId) {
     const voterId = document.getElementById('vote-as-select').value;
@@ -1590,6 +1661,15 @@ function endOnlineVoting() { fetch('/online/end_voting', { method: 'POST', heade
 
 // --- BLUFF RENDERING ---
 function renderBluffGame(data) {
+    const isMyTurn = (data.current_player === myPlayerId);
+    const currentHandLength = data.your_hand ? data.your_hand.length : 0;
+    
+    // Clear stale selections if the hand changed or turn shifted
+    if (!isMyTurn || currentHandLength !== window.prevHandLength) {
+        selectedBluffCards = [];
+    }
+    window.prevHandLength = currentHandLength;
+
     let playersHtml = data.players.map(p => {
         let cls = 'player-tag';
         if (p.id === data.current_player) cls += ' current';
@@ -1643,8 +1723,6 @@ function renderBluffGame(data) {
     let controlsHtml = '';
     document.getElementById('bluff-voting').style.display = 'none';
 
-    const isMyTurn = (data.current_player === myPlayerId);
-    
     if (data.phase === 'BLUFF_PLAYING' && isMyTurn) {
         if (!data.played_by) {
             controlsHtml = `
@@ -1669,9 +1747,10 @@ function renderBluffGame(data) {
             `;
         }
     } else if (data.phase === 'BLUFF_VOTING') {
-        controlsHtml = `<p style="color:var(--text-muted);">${data.players.find(p=>p.id===data.voting.target)?.name} has no cards! Vote required.</p>`;
+        controlsHtml = `<p style="color:var(--text-muted);">Wait for everyone to vote.</p>`;
         if (data.voting.active && !data.voting.votes[myPlayerId]) {
             document.getElementById('bluff-voting').style.display = 'block';
+            document.getElementById('bluff-voting-text').innerText = `${data.players.find(p=>p.id===data.voting.target)?.name} has no cards! Do you want to end the round or continue?`;
         }
     } else {
         controlsHtml = '';
@@ -1721,6 +1800,5 @@ function voteBluff(choice) {
 """
 
 if __name__ == '__main__':
-    # Disable debug in production
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     app.run(debug=debug_mode, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
