@@ -1,4 +1,4 @@
-# app.py – Unified Chameleon + Bluff (Critical Fixes for Chameleon Flow)
+# app.py – Unified Chameleon + Bluff (Complete Fixed Version)
 from flask import Flask, render_template_string, jsonify, request, session
 import random
 import string
@@ -7,7 +7,6 @@ import time
 import html
 import threading
 import os
-from functools import wraps
 from urllib.parse import urlparse
 
 app = Flask(__name__)
@@ -16,7 +15,6 @@ app.secret_key = os.environ.get('SECRET_KEY', 'unified_secret_key_change_in_prod
 # ---------- SECURITY HOOKS ----------
 @app.before_request
 def csrf_mitigation():
-    """Basic CSRF protection by validating the Referer header on state-changing requests."""
     if request.method == "POST":
         referer = request.headers.get('Referer')
         if referer:
@@ -109,6 +107,7 @@ game_state = {
 # ---------- ONLINE ROOMS ----------
 ROOMS = {}
 ROOM_EXPIRE_INACTIVE = 300
+ROOM_EXPIRE_IN_PROGRESS = 600
 ROOM_KEEP_ALIVE = 86400
 
 def clean_expired_rooms():
@@ -118,7 +117,8 @@ def clean_expired_rooms():
         for room_id, room in ROOMS.items():
             if room.get('keep_until', 0) > now:
                 continue
-            if now - room.get('last_activity', now) > ROOM_EXPIRE_INACTIVE:
+            threshold = ROOM_EXPIRE_INACTIVE if room['phase'] == 'LOBBY' else ROOM_EXPIRE_IN_PROGRESS
+            if now - room.get('last_activity', now) > threshold:
                 expired.append(room_id)
             elif len(room['players']) == 0:
                 expired.append(room_id)
@@ -135,7 +135,6 @@ def generate_room_id():
 
 def log_room_action(room, msg):
     timestamp = time.strftime("%H:%M:%S")
-    # Sanitize inputs dynamically while preserving intent
     safe_msg = html.escape(msg)
     with ROOMS_LOCK:
         room['game_log'].append(f"[{timestamp}] {safe_msg}")
@@ -143,7 +142,6 @@ def log_room_action(room, msg):
             room['game_log'].pop(0)
 
 def remove_player_and_manuals(room, target_id):
-    """Safely cascades the removal of a player and any of their connected manual players."""
     to_remove = [pid for pid, p in room['players'].items() if pid == target_id or p.get('device_id') == target_id]
     for pid in to_remove:
         if pid in room['players']:
@@ -195,7 +193,7 @@ def start_bluff_round(room):
     room['played_by'] = None
     room['consecutive_passes'] = 0
     room['winner'] = None
-    room['voting'] = {'active': False, 'votes': {}, 'target': None}
+    room['voting'] = None
     room['phase'] = 'BLUFF_PLAYING'
     room['last_activity'] = time.time()
     log_room_action(room, "🃏 Bluff started! Hands dealt.")
@@ -217,37 +215,6 @@ def next_bluff_turn(room):
         if len(room['players'][pid]['cards']) > 0:
             return pid
     return None
-
-def check_bluff_vote(room):
-    votes = room['voting']['votes']
-    target = room['voting']['target']
-    active_players = [p for p in room['players'] if not room['players'][p].get('is_manual')]
-    total = len(active_players)
-    
-    if len(votes) >= total:
-        room['voting']['active'] = False
-        end_votes = sum(1 for v in votes.values() if v == 'end')
-        continue_votes = total - end_votes
-        
-        if end_votes > continue_votes:
-            room['winner'] = target
-            room['phase'] = 'BLUFF_FINISHED'
-            log_room_action(room, f"🏆 {room['players'][target]['name']} wins the round!")
-        else:
-            if target in room['turn_order']:
-                idx = room['turn_order'].index(target)
-                room['turn_order'].remove(target)
-                log_room_action(room, f"➡️ {room['players'][target]['name']} is out of cards and continues watching.")
-                if len(room['turn_order']) > 0:
-                    # FIX: Safely compute and lock the next valid player index without double-advancing
-                    room['current_turn_index'] = idx % len(room['turn_order'])
-                    while len(room['players'][room['turn_order'][room['current_turn_index']]]['cards']) == 0:
-                        room['current_turn_index'] = (room['current_turn_index'] + 1) % len(room['turn_order'])
-            else:
-                next_bluff_turn(room)
-            
-            room['phase'] = 'BLUFF_PLAYING'
-        room['last_activity'] = time.time()
 
 # ---------- BACKGROUND THREAD ----------
 def cleanup_loop():
@@ -400,7 +367,6 @@ def online_list_games():
 @app.route('/online/create_game', methods=['POST'])
 def online_create_game():
     player_id = session.get('player_id')
-    # Sanitization applied
     name = html.escape(request.json.get('name', 'Host').strip()[:12] or 'Host')
     room_id = generate_room_id()
     
@@ -424,7 +390,6 @@ def online_create_game():
         'last_activity': time.time(),
         'keep_until': 0,
         'revealed_players': set(),
-        # Bluff states
         'turn_order': [],
         'current_turn_index': 0,
         'discard_pile': [],
@@ -434,7 +399,7 @@ def online_create_game():
         'played_by': None,
         'consecutive_passes': 0,
         'winner': None,
-        'voting': {'active': False, 'votes': {}, 'target': None}
+        'voting': None
     }
     
     with ROOMS_LOCK:
@@ -657,8 +622,7 @@ def online_room_state():
                 'claimed_rank': room['claimed_rank'],
                 'played_by': room['played_by'],
                 'discard_pile_count': len(room['discard_pile']),
-                'winner': room['winner'],
-                'voting': room['voting'] if room['phase'] == 'BLUFF_VOTING' else None
+                'winner': room['winner']
             })
 
     return jsonify(response)
@@ -684,6 +648,22 @@ def online_start_game():
             setup_new_online_round(room)
     return jsonify({'success': True})
 
+@app.route('/online/next_round', methods=['POST'])
+def online_next_round():
+    room_id = request.json.get('room_id')
+    player_id = session.get('player_id')
+    
+    with ROOMS_LOCK:
+        room = ROOMS.get(room_id)
+        if not room or player_id != room['host_id']:
+            return jsonify({'error': 'Host required'}), 403
+        if room['game_type'] == 'chameleon':
+            room['votes'] = {}
+            setup_new_online_round(room)
+        else:
+            start_bluff_round(room)
+    return jsonify({'success': True})
+
 # --- CHAMELEON ACTIONS ---
 @app.route('/online/reveal_role', methods=['POST'])
 def online_reveal_role():
@@ -700,7 +680,6 @@ def online_reveal_role():
         if not target_player:
             return jsonify({'error': 'Invalid target'}), 400
             
-        # Security Auth check
         if target_id != player_id and target_player.get('device_id') != player_id:
             return jsonify({'error': 'Unauthorized to reveal this role'}), 403
             
@@ -743,6 +722,8 @@ def online_verify_code():
             code = str(data.get('code', '')).strip()
             for pid, expected_code in room['player_codes'].items():
                 if expected_code == code:
+                    if pid != player_id and room['players'][pid].get('device_id') != player_id:
+                        continue
                     is_cham = (room['roles'][pid] == 'CHAMELEON')
                     return jsonify({'valid': True, 'is_chameleon': is_cham, 'col': room['col'], 'row': room['row']})
             return jsonify({'valid': False})
@@ -752,7 +733,6 @@ def online_verify_code():
             if not tgt_player:
                 return jsonify({'valid': False})
                 
-            # Security Auth check for manual mode
             if tgt != player_id and tgt_player.get('device_id') != player_id:
                 return jsonify({'valid': False})
                 
@@ -772,7 +752,6 @@ def online_change_topic():
         if not room:
             return jsonify({'error': 'Room not found'}), 404
             
-        # Security Auth Check: Host privilege
         if room['host_id'] != player_id:
             return jsonify({'error': 'Only the host can change the topic'}), 403
         
@@ -814,9 +793,8 @@ def online_cast_vote():
         if not voter_player:
             return jsonify({'error': 'Invalid voter'}), 400
             
-        # Security Auth check
         if voter_id != player_id and voter_player.get('device_id') != player_id:
-             return jsonify({'error': 'Unauthorized to cast this vote'}), 403
+            return jsonify({'error': 'Unauthorized to cast this vote'}), 403
         
         if voter_id in room['votes']:
             return jsonify({'error': 'Already voted'}), 400
@@ -848,6 +826,15 @@ def online_restart():
             room['phase'] = 'LOBBY'
             room['revealed_players'] = set()
             room['votes'] = {}
+            room['turn_order'] = []
+            room['current_turn_index'] = 0
+            room['discard_pile'] = []
+            room['played_cards'] = []
+            room['last_played_cards'] = []
+            room['claimed_rank'] = ''
+            room['played_by'] = None
+            room['consecutive_passes'] = 0
+            room['winner'] = None
     return jsonify({'success': True})
 
 # --- BLUFF ACTIONS ---
@@ -946,15 +933,10 @@ def online_bluff_action():
             room['claimed_rank'] = ''
             room['played_by'] = None
             
-            if len(room['players'][played_by]['cards']) == 0 and pick_up != played_by:
-                room['phase'] = 'BLUFF_VOTING'
-                room['voting'] = {'active': True, 'votes': {}, 'target': played_by}
-                log_room_action(room, f"❗ {room['players'][played_by]['name']} won the challenge on their last card! Voting to evaluate win...")
+            if turn_to in room['turn_order']:
+                room['current_turn_index'] = room['turn_order'].index(turn_to)
             else:
-                if turn_to in room['turn_order']:
-                    room['current_turn_index'] = room['turn_order'].index(turn_to)
-                else:
-                    next_bluff_turn(room)
+                next_bluff_turn(room)
                 
             return jsonify({'success': True})
 
@@ -979,10 +961,10 @@ def online_bluff_action():
                 room['played_by'] = None
                 room['consecutive_passes'] = 0
                 
-                if played_by and len(room['players'][played_by]['cards']) == 0:
-                    room['phase'] = 'BLUFF_VOTING'
-                    room['voting'] = {'active': True, 'votes': {}, 'target': played_by}
-                    log_room_action(room, f"🔄 Everyone passed on {room['players'][played_by]['name']}'s last cards! Voting to evaluate win...")
+                if played_by in room['turn_order'] and len(room['players'][played_by]['cards']) == 0:
+                    room['turn_order'].remove(played_by)
+                    log_room_action(room, f"💀 {room['players'][played_by]['name']} is eliminated (no cards left)")
+                    next_bluff_turn(room)
                 else:
                     log_room_action(room, f"🔄 Everyone passed. {room['players'][played_by]['name']} clears the pile and goes again.")
                     if played_by in room['turn_order']:
@@ -990,20 +972,6 @@ def online_bluff_action():
             else:
                 next_bluff_turn(room)
                 
-            return jsonify({'success': True})
-
-        elif action == 'vote':
-            if room['phase'] != 'BLUFF_VOTING' or not room['voting']['active']:
-                return jsonify({'error': 'Voting not active'}), 400
-            if pid not in room['players'] or room['players'][pid].get('is_manual'):
-                return jsonify({'error': 'Cannot vote'}), 400
-            if pid in room['voting']['votes']:
-                return jsonify({'error': 'Already voted'}), 400
-            if data.get('vote') not in ['end', 'continue']:
-                return jsonify({'error': 'Invalid vote'}), 400
-            
-            room['voting']['votes'][pid] = data.get('vote')
-            check_bluff_vote(room)
             return jsonify({'success': True})
 
     return jsonify({'error': 'Unknown action'}), 400
@@ -1043,13 +1011,9 @@ HTML_TEMPLATE = """
         th, td { border-radius: 8px; padding: 12px 4px; text-align: center; font-size: 14px; background: #334155; }
         td.highlight { background: var(--accent) !important; color: #000 !important; font-weight: bold; box-shadow: 0 0 12px rgba(6, 182, 212, 0.6); }
         .alert-box { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); font-weight: 600; padding: 14px; border-radius: 12px; margin: 12px 0; }
-        
-        /* Game Logs */
         .game-log { background: #0f172a; border-radius: 8px; padding: 8px; margin: 12px 0; overflow-y: auto; text-align: left; font-size: 13.5px; border: 1px solid #334155; color: var(--text-muted); scroll-behavior: smooth;}
         .game-log div { border-bottom: 1px solid #1e293b; padding: 5px 6px; }
-        .game-log div:last-child { border-bottom: none; font-weight: bold; color: var(--text); } 
-        
-        /* Bluff styling */
+        .game-log div:last-child { border-bottom: none; font-weight: bold; color: var(--text); }
         .hand { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin: 12px 0; }
         .card-item { background: white; color: #000; border-radius: 8px; padding: 8px 6px; min-width: 40px; font-weight: bold; text-align: center; cursor: pointer; border: 2px solid transparent; transition: all 0.2s; }
         .card-item.selected { border-color: var(--accent); box-shadow: 0 0 12px var(--accent); transform: scale(1.05); background: #e0f2fe; }
@@ -1057,8 +1021,6 @@ HTML_TEMPLATE = """
         .player-tag { display: inline-block; background: #334155; padding: 4px 10px; border-radius: 12px; margin: 4px; font-size: 13px; }
         .player-tag.current { background: var(--accent); color: #000; font-weight:bold; animation: pulse 2s infinite; }
         @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(6, 182, 212, 0.7); } 70% { box-shadow: 0 0 0 10px rgba(6, 182, 212, 0); } 100% { box-shadow: 0 0 0 0 rgba(6, 182, 212, 0); } }
-
-        /* Chat */
         @keyframes pulseBadge { 0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); } 70% { transform: scale(1.2); box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); } 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); } }
         .pulse-anim { animation: pulseBadge 1.5s infinite; }
         #chat-toggle-btn { position: fixed; bottom: 20px; right: 20px; z-index: 1000; width: 60px; height: 60px; border-radius: 50%; background: var(--accent); color: white; border: none; font-size: 28px; cursor: pointer; box-shadow: 0 4px 15px rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; }
@@ -1074,12 +1036,8 @@ HTML_TEMPLATE = """
         #chat-input-row { display: flex; padding: 8px; gap: 6px; border-top: 1px solid rgba(255,255,255,0.05); background: rgba(0,0,0,0.2); }
         #chat-input-row input { margin:0; font-size:14px; }
         #chat-input-row button { background: var(--accent); color: white; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer; }
-
-        /* Toast notifications */
         .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: #334155; color: white; padding: 12px 20px; border-radius: 8px; z-index: 2000; animation: slideDown 0.3s ease; }
         @keyframes slideDown { from { opacity: 0; transform: translate(-50%, -20px); } to { opacity: 1; transform: translate(-50%, 0); } }
-        
-        /* Modal */
         .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 1500; display: flex; align-items: center; justify-content: center; }
         .modal-content { background: var(--card-bg); border-radius: 16px; padding: 20px; max-width: 400px; width: 90%; max-height: 80vh; overflow-y: auto; }
         .topic-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0; }
@@ -1090,16 +1048,13 @@ HTML_TEMPLATE = """
 <body>
 <div class="card">
     <h2>🎮 Game Hub</h2>
-    <div id="room-badge" class="badge" style="display: none;">ROOM: <span id="room-code-display"></span> <button onclick="copyRoomCode()" style="background:none;border:none;color:var(--accent);cursor:pointer;">📋</button></div>
 
-    <!-- LANDING -->
     <div id="screen-landing" class="screen active-screen">
         <button class="btn btn-start" onclick="selectMode('LOCAL')">📱 Pass & Play (Local)</button>
         <button class="btn btn-topic" onclick="selectMode('ONLINE')">🌐 Online Multiplayer</button>
         <button class="btn" style="background:#475569;" onclick="showRules()">📖 How to Play</button>
     </div>
 
-    <!-- LOCAL PASS & PLAY -->
     <div id="screen-local-start" class="screen">
         <p style="color: var(--text-muted);">Number of Players:</p>
         <div class="player-selector" id="local-player-grid">
@@ -1138,7 +1093,6 @@ HTML_TEMPLATE = """
         <button class="btn" style="background:#475569; margin-top:20px;" onclick="goToLanding()">🏠 End Game</button>
     </div>
 
-    <!-- ONLINE MULTIPLAYER -->
     <div id="screen-online-start" class="screen">
         <input type="text" id="online-player-name" placeholder="Your Name" maxlength="12">
         <button class="btn btn-start" onclick="createOnlineGame()">➕ Create Lobby</button>
@@ -1146,7 +1100,6 @@ HTML_TEMPLATE = """
         <button class="btn" style="background:#334155; margin-top:10px;" onclick="goToLanding()">⬅ Back</button>
     </div>
 
-    <!-- ONLINE LOBBY -->
     <div id="screen-online-lobby" class="screen">
         <div id="host-game-settings" style="display:none; background: #334155; padding:15px; border-radius:10px; margin-bottom:15px;">
             <label style="color:var(--accent); font-weight:bold;">Select Gamemode:</label>
@@ -1178,9 +1131,9 @@ HTML_TEMPLATE = """
         <button id="btn-start-online" class="btn btn-start" style="display:none; margin-top:20px;" onclick="startOnlineGame()">🚀 Start Game</button>
         <p id="online-wait-msg" style="color:var(--warning); display:none; margin-top:20px;">Waiting for host...</p>
         <button class="btn" style="background:#475569; margin-top:10px;" onclick="leaveOnlineGame()">🚪 Leave</button>
+        <button id="btn-disband-room" class="btn btn-danger" style="display:none; margin-top:10px;" onclick="disbandRoom()">❌ Disband Room</button>
     </div>
 
-    <!-- ONLINE CHAMELEON ROLE REVEAL -->
     <div id="screen-online-roles" class="screen">
         <h3 id="online-player-turn-header" style="color: var(--accent);"></h3>
         <button id="online-reveal-role-btn" class="btn" onclick="revealOnlineRole()">👁️ Show Secret Role</button>
@@ -1194,17 +1147,21 @@ HTML_TEMPLATE = """
     <div id="screen-online-grid" class="screen">
         <h3 id="online-topic-title" style="color: var(--warning);"></h3>
         <button id="btn-online-change-topic" class="btn btn-topic" style="display:none;" onclick="openTopicModal('online')">🔀 Change Topic</button>
+        <table id="online-grid-table"></table>
         <div style="margin-top:15px;">
-            <div id="online-code-input-area"><input type="text" id="online-player-code-input" placeholder="Enter Code"/></div>
-            <div id="online-no-code-area" style="display:none;"><select id="online-viewer-select"></select></div>
-            <button class="btn" onclick="verifyOnlineCode()">🔓 Reveal Target</button>
+            <div id="online-code-input-area">
+                <input type="text" id="online-player-code-input" placeholder="Enter your secret code"/>
+                <button class="btn" onclick="verifyOnlineCode()">🔓 Reveal My Info</button>
+            </div>
+            <div id="online-no-code-area" style="display:none;">
+                <select id="online-viewer-select"></select>
+                <button class="btn" onclick="verifyOnlineCode()">🔓 Reveal My Info</button>
+            </div>
         </div>
         <div id="online-decrypted-info" style="display:none; margin-top:20px;">
             <div id="online-result-alert" class="alert-box"></div>
-            <table id="online-grid-table"></table>
-            <button class="btn" onclick="resetOnlineGrid()" style="margin-top:15px;">🔒 Hide</button>
+            <button class="btn" onclick="resetOnlineGrid()" style="margin-top:15px;">🔒 Hide Info</button>
         </div>
-        
         <div id="online-chameleon-log" class="game-log" style="height: 90px;"></div>
         <button id="btn-start-voting" class="btn btn-danger" style="display:none; margin-top:20px;" onclick="startOnlineVoting()">🗳️ Start Voting</button>
     </div>
@@ -1217,24 +1174,17 @@ HTML_TEMPLATE = """
         <button id="btn-end-voting" class="btn btn-danger" style="display:none; margin-top:20px;" onclick="endOnlineVoting()">Force End Voting</button>
     </div>
 
-    <!-- ONLINE BLUFF -->
     <div id="screen-online-bluff" class="screen">
         <div id="bluff-players"></div>
         <div id="bluff-game-log" class="game-log" style="height: 120px;"></div>
         <div id="bluff-turn" style="color:var(--warning); font-weight:bold; margin:10px 0;"></div>
         <div id="bluff-hand"></div>
         <div id="bluff-controls" style="margin-top:15px;"></div>
-        <div id="bluff-voting" style="display:none; margin-top:15px; background:rgba(245,158,11,0.2); padding:10px; border-radius:10px;">
-            <p id="bluff-voting-text" style="color:var(--warning);"></p>
-            <button class="btn btn-success" onclick="voteBluff('end')">🏆 End Round</button>
-            <button class="btn" onclick="voteBluff('continue')" style="background:#475569;">➡️ Continue</button>
-        </div>
         <div id="bluff-winner" style="display:none; margin-top:20px;"></div>
         <button class="btn" style="background:#475569; margin-top:20px;" onclick="leaveOnlineGame()">🚪 Leave Room</button>
     </div>
 </div>
 
-<!-- GLOBAL CHAT -->
 <button id="chat-toggle-btn" onclick="toggleChat()">💬<span id="chat-badge" class="badge pulse-anim" style="display:none;">0</span></button>
 <div id="chat-container">
     <div id="chat-header"><span>💬 Global Chat</span><button onclick="toggleChat()">✕</button></div>
@@ -1243,7 +1193,6 @@ HTML_TEMPLATE = """
 </div>
 
 <script>
-// --- TOAST SYSTEM ---
 function showToast(message) {
     const toast = document.createElement('div');
     toast.className = 'toast';
@@ -1252,7 +1201,6 @@ function showToast(message) {
     setTimeout(() => toast.remove(), 3000);
 }
 
-// --- CHAT SYSTEM ---
 let chatVisible = false, chatUnread = 0, chatUsername = localStorage.getItem('chatUsername') || '', lastMsgCount = 0;
 function toggleChat() {
     chatVisible = !chatVisible;
@@ -1271,7 +1219,7 @@ function sendChat() {
     const text = input.value.trim();
     if (!text) return;
     if (!chatUsername) {
-        chatUsername = prompt("Enter Your REAL NAME:") || "Anonymous";
+        chatUsername = prompt("Username:") || "Anonymous";
         localStorage.setItem('chatUsername', chatUsername);
     }
     fetch('/global_chat/send', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({username: chatUsername, text}) }).then(() => { input.value = ''; loadChat(); });
@@ -1294,19 +1242,12 @@ function loadChat() {
 document.getElementById('chat-input').addEventListener('keydown', e => { if (e.key === 'Enter') sendChat(); });
 setInterval(loadChat, 3000);
 
-// --- NAVIGATION ---
 function showScreen(id) { document.querySelectorAll('.screen').forEach(el => el.classList.remove('active-screen')); document.getElementById(id).classList.add('active-screen'); }
 function selectMode(mode) { if (mode === 'LOCAL') { showScreen('screen-local-start'); } else { showScreen('screen-online-start'); refreshOnlineGames(); } }
 function goToLanding() {
     if (pollInterval) clearInterval(pollInterval);
     currentRoom = null;
-    document.getElementById('room-badge').style.display = 'none';
     showScreen('screen-landing');
-}
-
-function copyRoomCode() {
-    const code = document.getElementById('room-code-display').innerText;
-    navigator.clipboard.writeText(code).then(() => showToast('Room code copied!'));
 }
 
 function showRules() {
@@ -1325,7 +1266,6 @@ function showRules() {
     document.body.insertAdjacentHTML('beforeend', rules);
 }
 
-// --- LOCAL PASS & PLAY ---
 let localPlayers = 4, localUseCodes = true;
 function selectLocalPlayers(num) { localPlayers = num; document.querySelectorAll('#local-player-grid .p-opt').forEach(el => el.classList.toggle('selected', parseInt(el.innerText) === num)); }
 function toggleLocalCodes() {
@@ -1402,7 +1342,6 @@ function renderGrid(tableId, targetCol, targetRow) {
     document.getElementById(tableId).innerHTML = html;
 }
 
-// --- TOPIC MODAL ---
 function openTopicModal(prefix) {
     const topicNames = {{ topics|tojson }};
     const modal = document.createElement('div');
@@ -1436,11 +1375,10 @@ function changeTopic(prefix, type) {
         });
 }
 
-// --- ONLINE MULTIPLAYER ---
 let currentRoom = null, isHost = false, myPlayerId = null, pollInterval = null;
 let selectedBluffCards = [];
 window.currentRevealId = null;
-window.prevHandLength = 0;
+let roleRevealed = false;
 
 function refreshOnlineGames() {
     fetch('/online/list_games').then(r => r.json()).then(games => {
@@ -1463,10 +1401,14 @@ function joinOnlineGame(rid) {
 function leaveOnlineGame() {
     fetch('/online/leave_room', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom}) }).then(() => goToLanding());
 }
+function disbandRoom() {
+    if (confirm('Are you sure you want to disband this room?')) {
+        fetch('/online/leave_room', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom}) })
+            .then(() => goToLanding());
+    }
+}
 
 function startOnlinePoll() {
-    document.getElementById('room-badge').style.display = 'inline-block';
-    document.getElementById('room-code-display').innerText = currentRoom;
     if (pollInterval) clearInterval(pollInterval);
     pollInterval = setInterval(onlinePollState, 1000);
     onlinePollState();
@@ -1482,6 +1424,7 @@ function addManualPlayer() {
     fetch('/online/add_manual_player', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom, name, device_id}) }).then(() => document.getElementById('manual-player-name').value='');
 }
 function startOnlineGame() { fetch('/online/start_game', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom}) }).then(r=>r.json()).then(data=>{if(data.error)showToast(data.error);}); }
+function nextRound() { fetch('/online/next_round', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom}) }).then(r=>r.json()).then(data=>{if(data.error)showToast(data.error);}); }
 function restartOnlineGame() { fetch('/online/restart', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom}) }); }
 
 function updateLogBox(elementId, messages) {
@@ -1502,8 +1445,6 @@ function updateElementIfChanged(element, newHtml) {
     return false;
 }
 
-let roleRevealed = false;
-
 function onlinePollState() {
     fetch(`/online/room_state?room=${currentRoom}`).then(r => r.json()).then(data => {
         if (data.error) { goToLanding(); return; }
@@ -1519,6 +1460,7 @@ function onlinePollState() {
             document.getElementById('player-request-gamemode').style.display = isHost ? 'none' : 'block';
             document.getElementById('btn-start-online').style.display = isHost ? 'block' : 'none';
             document.getElementById('online-wait-msg').style.display = isHost ? 'none' : 'block';
+            document.getElementById('btn-disband-room').style.display = isHost ? 'block' : 'none';
             if (isHost) document.getElementById('online-game-type').value = data.game_type;
 
             if (data.game_type === 'bluff') {
@@ -1555,7 +1497,7 @@ function onlinePollState() {
             updateLogBox('bluff-game-log', data.game_log);
             renderBluffGame(data);
         }
-        else { // Chameleon
+        else {
             if (data.phase === 'ROLE_REVEAL') {
                 showScreen('screen-online-roles');
                 
@@ -1578,32 +1520,37 @@ function onlinePollState() {
                 updateLogBox('online-chameleon-log', data.game_log);
                 document.getElementById('online-topic-title').innerText = data.topic_name;
                 window.currentGrid = data.grid;
+                renderGrid('online-grid-table', null, null);
                 document.getElementById('btn-online-change-topic').style.display = isHost ? 'inline-block' : 'none';
                 document.getElementById('btn-start-voting').style.display = isHost ? 'inline-block' : 'none';
                 
-                if(data.use_codes) { 
-                    document.getElementById('online-code-input-area').style.display = 'block'; 
-                    document.getElementById('online-no-code-area').style.display = 'none'; 
-                } else { 
-                    document.getElementById('online-code-input-area').style.display = 'none'; 
-                    document.getElementById('online-no-code-area').style.display = 'block'; 
-                    document.getElementById('online-viewer-select').innerHTML = data.device_players.map(p => `<option value="${p.id}">${p.name}</option>`).join(''); 
+                document.getElementById('online-code-input-area').style.display = data.use_codes ? 'block' : 'none';
+                document.getElementById('online-no-code-area').style.display = !data.use_codes ? 'block' : 'none';
+                if (!data.use_codes) {
+                    document.getElementById('online-viewer-select').innerHTML = data.device_players.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
                 }
+                document.getElementById('online-decrypted-info').style.display = 'none';
+                document.getElementById('online-player-code-input').value = '';
             } else if (data.phase === 'VOTING') {
                 roleRevealed = false;
                 showScreen('screen-online-voting');
                 document.getElementById('vote-as-select').innerHTML = data.device_players.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
                 document.getElementById('vote-targets').innerHTML = data.players.map(p => `<button class="btn btn-option" onclick="castOnlineVote('${p.id}')">${p.name}</button>`).join('');
                 document.getElementById('btn-end-voting').style.display = isHost ? 'block' : 'none';
+                document.getElementById('vote-as-select').style.display = 'block';
             } else if (data.phase === 'RESULTS') {
                 roleRevealed = false;
                 showScreen('screen-online-voting');
                 let html = `<h3 style="color:var(--success);">Word: ${data.secret_word}</h3>`;
                 html += `<h4 style="color:var(--warning);">Chameleon: ${data.chameleon_name}</h4>`;
                 html += `<div>${data.vote_results.map(v => `<p>${v.name}: ${v.count} votes</p>`).join('')}</div>`;
-                if(isHost) html += `<button class="btn btn-start" onclick="restartOnlineGame()">🔄 Play Again</button>`;
+                if (isHost) {
+                    html += `<button class="btn btn-start" onclick="nextRound()">🔄 Play Again</button>`;
+                    html += `<button class="btn" style="background:#475569;" onclick="restartOnlineGame()">🏠 Return to Lobby</button>`;
+                }
                 document.getElementById('vote-targets').innerHTML = html;
                 document.getElementById('vote-as-select').style.display = 'none';
+                document.getElementById('btn-end-voting').style.display = 'none';
             }
         }
     });
@@ -1628,8 +1575,11 @@ function nextOnlinePlayer() {
 
 function verifyOnlineCode() {
     let payload = { room_id: currentRoom };
-    if (window.onlineUseCodes) payload.code = document.getElementById('online-player-code-input').value;
-    else payload.player_id = document.getElementById('online-viewer-select').value;
+    if (window.onlineUseCodes) {
+        payload.code = document.getElementById('online-player-code-input').value;
+    } else {
+        payload.player_id = document.getElementById('online-viewer-select').value;
+    }
     fetch('/online/verify_code', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) }).then(r=>r.json()).then(data => {
         if (!data.valid) { showToast("Invalid code or unauthorized."); return; }
         document.getElementById('online-code-input-area').style.display = 'none';
@@ -1647,9 +1597,13 @@ function verifyOnlineCode() {
 
 function resetOnlineGrid() {
     document.getElementById('online-decrypted-info').style.display = 'none';
-    if(window.onlineUseCodes) document.getElementById('online-code-input-area').style.display = 'block';
-    else document.getElementById('online-no-code-area').style.display = 'block';
-    document.getElementById('online-player-code-input').value = '';
+    if (window.onlineUseCodes) {
+        document.getElementById('online-code-input-area').style.display = 'block';
+        document.getElementById('online-player-code-input').value = '';
+    } else {
+        document.getElementById('online-no-code-area').style.display = 'block';
+    }
+    renderGrid('online-grid-table', null, null);
 }
 
 function startOnlineVoting() { fetch('/online/start_voting_phase', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom}) }); }
@@ -1659,12 +1613,9 @@ function castOnlineVote(targetId) {
 }
 function endOnlineVoting() { fetch('/online/end_voting', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom}) }); }
 
-// --- BLUFF RENDERING ---
 function renderBluffGame(data) {
     const isMyTurn = (data.current_player === myPlayerId);
     const currentHandLength = data.your_hand ? data.your_hand.length : 0;
-    
-    // Clear stale selections if the hand changed or turn shifted
     if (!isMyTurn || currentHandLength !== window.prevHandLength) {
         selectedBluffCards = [];
     }
@@ -1679,18 +1630,14 @@ function renderBluffGame(data) {
     
     if (data.phase === 'BLUFF_FINISHED') {
         document.getElementById('bluff-winner').style.display = 'block';
-        
         const winnerObj = data.players.find(p => p.id === data.winner);
-        if (winnerObj) {
-            const isLoser = winnerObj.card_count > 0;
-            const finishTitle = isLoser ? `🤡 ${winnerObj.name} is the last one left! (Loser)` : `🏆 ${winnerObj.name} Wins!`;
-            
-            document.getElementById('bluff-winner').innerHTML = `
-                <h3 style="${isLoser ? 'color:var(--danger);' : 'color:var(--success);'}">${finishTitle}</h3>
-                <button class="btn btn-start" id="btn-bluff-restart" style="display:${isHost ? 'inline-block' : 'none'};" onclick="restartOnlineGame()">🔄 Play Again</button>
-            `;
-        }
-        
+        const isLoser = winnerObj && winnerObj.card_count > 0;
+        const title = isLoser ? `🤡 ${winnerObj.name} is the last one left! (Loser)` : `🏆 ${winnerObj.name} Wins!`;
+        document.getElementById('bluff-winner').innerHTML = `
+            <h3 style="${isLoser ? 'color:var(--danger);' : 'color:var(--success);'}">${title}</h3>
+            <button class="btn btn-start" onclick="nextRound()">🔄 Play Again</button>
+            <button class="btn" style="background:#475569;" onclick="restartOnlineGame()">🏠 Return to Lobby</button>
+        `;
         document.getElementById('bluff-controls').innerHTML = '';
         document.getElementById('bluff-turn').innerText = '';
         return;
@@ -1721,7 +1668,6 @@ function renderBluffGame(data) {
 
     const controls = document.getElementById('bluff-controls');
     let controlsHtml = '';
-    document.getElementById('bluff-voting').style.display = 'none';
 
     if (data.phase === 'BLUFF_PLAYING' && isMyTurn) {
         if (!data.played_by) {
@@ -1745,12 +1691,6 @@ function renderBluffGame(data) {
                     </div>
                 </div>
             `;
-        }
-    } else if (data.phase === 'BLUFF_VOTING') {
-        controlsHtml = `<p style="color:var(--text-muted);">Wait for everyone to vote.</p>`;
-        if (data.voting.active && !data.voting.votes[myPlayerId]) {
-            document.getElementById('bluff-voting').style.display = 'block';
-            document.getElementById('bluff-voting-text').innerText = `${data.players.find(p=>p.id===data.voting.target)?.name} has no cards! Do you want to end the round or continue?`;
         }
     } else {
         controlsHtml = '';
@@ -1789,10 +1729,6 @@ function playMoreCards() {
 function bluffAction(act) { 
     fetch('/online/bluff_action', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom, action: act}) })
         .then(r=>r.json()).then(data => { if(data.error) showToast(data.error); else { selectedBluffCards = []; } });
-}
-function voteBluff(choice) { 
-    fetch('/online/bluff_action', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom, action: 'vote', vote: choice}) })
-        .then(r=>r.json()).then(data => { if(data.error) showToast(data.error); });
 }
 </script>
 </body>
