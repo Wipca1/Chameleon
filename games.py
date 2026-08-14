@@ -1,4 +1,4 @@
-# app.py – Unified Chameleon + Bluff (Complete Fixed Version with 3-Player Option)
+# app.py – Unified Chameleon + Bluff (Complete with Chat Notifications & Chameleon Reveal)
 from flask import Flask, render_template_string, jsonify, request, session
 import random
 import string
@@ -205,7 +205,7 @@ def start_bluff_round(room):
 
 def next_bluff_turn(room):
     active_cards = [p for p in room['turn_order'] if len(room['players'][p]['cards']) > 0]
-    
+
     if len(active_cards) <= 1:
         room['phase'] = 'BLUFF_FINISHED'
         loser_id = active_cards[0] if active_cards else None
@@ -213,7 +213,7 @@ def next_bluff_turn(room):
         if loser_id:
             log_room_action(room, f"🏁 Game Over! {room['players'][loser_id]['name']} is the last one with cards!")
         return None
-        
+
     for _ in range(len(room['turn_order'])):
         room['current_turn_index'] = (room['current_turn_index'] + 1) % len(room['turn_order'])
         pid = room['turn_order'][room['current_turn_index']]
@@ -267,7 +267,7 @@ def local_start_game():
     data = request.json or {}
     players_count = int(data.get('players_count', 3))
     use_codes = data.get('use_codes', True)
-    
+
     with GAME_STATE_LOCK:
         game_state['players_count'] = players_count
         game_state['use_codes'] = use_codes
@@ -293,7 +293,6 @@ def local_start_game():
         topic_name, grid = random.choice(list(TOPIC_CARDS.items()))
         game_state['topic_name'] = topic_name
         game_state['grid'] = grid
-        # For local, we don't need secret_word separately; it's derived from grid and coordinates.
         game_state['phase'] = 'ROLES' if use_codes else 'PUBLIC_GRID'
     return jsonify({'success': True})
 
@@ -335,13 +334,13 @@ def local_change_topic():
     data = request.json
     req_type = data.get('type')
     topic_name = data.get('topic')
-    
+
     with GAME_STATE_LOCK:
         if req_type == 'random' or not topic_name or topic_name not in TOPIC_CARDS:
             topic_name, grid = random.choice(list(TOPIC_CARDS.items()))
         else:
             grid = TOPIC_CARDS[topic_name]
-        
+
         game_state['topic_name'] = topic_name
         game_state['grid'] = grid
         game_state['col'], game_state['row'] = get_random_coordinates()
@@ -352,6 +351,16 @@ def local_restart():
     with GAME_STATE_LOCK:
         game_state['phase'] = 'START_SCREEN'
     return jsonify({'success': True})
+
+@app.route('/local/get_chameleon', methods=['POST'])
+def local_get_chameleon():
+    with GAME_STATE_LOCK:
+        if game_state['chameleon_idx'] < 0:
+            return jsonify({'error': 'Game not started'}), 400
+        return jsonify({
+            'chameleon_player': game_state['chameleon_idx'] + 1,
+            'chameleon_name': f"Player {game_state['chameleon_idx'] + 1}"
+        })
 
 # ---------- ONLINE ROUTES ----------
 @app.route('/online/list_games')
@@ -375,7 +384,7 @@ def online_create_game():
     player_id = session.get('player_id')
     name = html.escape(request.json.get('name', 'Host').strip()[:12] or 'Host')
     room_id = generate_room_id()
-    
+
     room_data = {
         'host_id': player_id,
         'phase': 'LOBBY',
@@ -400,18 +409,18 @@ def online_create_game():
         'current_turn_index': 0,
         'discard_pile': [],
         'played_cards': [],
-        'last_played_cards': [], 
+        'last_played_cards': [],
         'claimed_rank': '',
         'played_by': None,
         'consecutive_passes': 0,
         'winner': None,
         'voting': None
     }
-    
+
     with ROOMS_LOCK:
         ROOMS[room_id] = room_data
         log_room_action(ROOMS[room_id], f"Room created by {name}")
-    
+
     return jsonify({'room_id': room_id, 'is_host': True})
 
 @app.route('/online/set_game', methods=['POST'])
@@ -419,7 +428,7 @@ def online_set_game():
     room_id = request.json.get('room_id')
     game_type = request.json.get('game_type')
     player_id = session.get('player_id')
-    
+
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if not room or player_id != room['host_id']:
@@ -436,7 +445,7 @@ def online_request_gamemode():
     room_id = request.json.get('room_id')
     mode = request.json.get('mode')
     player_id = session.get('player_id')
-    
+
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if room and player_id in room['players']:
@@ -450,7 +459,7 @@ def online_join_game():
     player_id = session.get('player_id')
     name = html.escape(request.json.get('name', 'Player').strip()[:12] or 'Player')
     room_id = request.json.get('room_id')
-    
+
     with ROOMS_LOCK:
         if room_id not in ROOMS:
             return jsonify({'success': False, 'error': 'Room not found.'})
@@ -470,12 +479,12 @@ def online_add_manual_player():
     player_id = session.get('player_id')
     name = html.escape(request.json.get('name', 'Player').strip()[:12] or 'Player')
     device_id = request.json.get('device_id', player_id)
-    
+
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if not room or player_id != room['host_id']:
             return jsonify({'error': 'Host required'}), 403
-        
+
         manual_id = f"manual_{int(time.time())}_{random.randint(100,999)}"
         room['players'][manual_id] = {'name': name, 'is_host': False, 'is_manual': True, 'device_id': device_id}
         room['last_activity'] = time.time()
@@ -486,7 +495,7 @@ def online_remove_player():
     room_id = request.json.get('room_id')
     target_id = request.json.get('player_id')
     player_id = session.get('player_id')
-    
+
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if not room or player_id != room['host_id']:
@@ -495,13 +504,13 @@ def online_remove_player():
             return jsonify({'error': 'Cannot remove host'}), 400
         if target_id not in room['players']:
             return jsonify({'error': 'Player not found'}), 404
-        
+
         p_name = room['players'][target_id]['name']
         remove_player_and_manuals(room, target_id)
-        
+
         room['last_activity'] = time.time()
         log_room_action(room, f"🚪 {p_name} was removed.")
-        
+
         if room['phase'] not in ['LOBBY', 'WAITING_DEVICE_SETUP']:
             room['phase'] = 'LOBBY'
     return jsonify({'success': True})
@@ -520,28 +529,28 @@ def online_keep_room():
 def online_leave_room():
     room_id = request.json.get('room_id')
     player_id = session.get('player_id')
-    
+
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if not room:
             return jsonify({'success': False, 'error': 'Room not found'})
-            
+
         if player_id == room['host_id']:
             del ROOMS[room_id]
             return jsonify({'success': True, 'disbanded': True})
-            
+
         if player_id in room['players']:
             remove_player_and_manuals(room, player_id)
             if room['phase'] not in ['LOBBY', 'WAITING_DEVICE_SETUP']:
                 room['phase'] = 'LOBBY'
-                
+
     return jsonify({'success': True, 'disbanded': False})
 
 @app.route('/online/toggle_codes', methods=['POST'])
 def online_toggle_codes():
     room_id = request.json.get('room_id')
     use_codes = request.json.get('use_codes')
-    
+
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if room and session.get('player_id') == room['host_id']:
@@ -554,7 +563,7 @@ def online_room_state():
     room_id = request.args.get('room')
     player_id = session.get('player_id')
     clean_expired_rooms()
-    
+
     with ROOMS_LOCK:
         if room_id not in ROOMS:
             return jsonify({'error': 'Room not found.'})
@@ -578,7 +587,7 @@ def online_room_state():
         response = {
             'phase': room['phase'],
             'game_type': room.get('game_type', 'chameleon'),
-            'game_log': room.get('game_log', [])[-15:], 
+            'game_log': room.get('game_log', [])[-15:],
             'players': players_list,
             'total_players': len(room['players']),
             'is_host': (player_id == room['host_id']),
@@ -591,7 +600,7 @@ def online_room_state():
                 for pid, pinfo in room['players'].items()
                 if pid == player_id or pinfo.get('device_id') == player_id
             ]
-            
+
             response.update({
                 'topic_name': room['topic_name'],
                 'grid': room['grid'],
@@ -604,18 +613,17 @@ def online_room_state():
                 'device_players': device_players,
                 'chameleon_caught': None
             })
-            
+
             if room['phase'] == 'RESULTS':
                 counts = {pid: 0 for pid in room['players']}
                 for target in room['votes'].values():
                     if target in counts: counts[target] += 1
                 for pid, cnt in counts.items():
                     response['vote_results'].append({'name': room['players'][pid]['name'], 'count': cnt})
-                
+
                 # Determine if chameleon was caught
                 if counts:
                     max_votes = max(counts.values())
-                    # If there's a tie, chameleon is not caught (standard rule)
                     if max_votes > 0 and counts.get(room['chameleon_id'], 0) == max_votes:
                         response['chameleon_caught'] = True
                     else:
@@ -649,7 +657,7 @@ def online_room_state():
 def online_start_game():
     room_id = request.json.get('room_id')
     player_id = session.get('player_id')
-    
+
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if not room or player_id != room['host_id']:
@@ -670,7 +678,7 @@ def online_start_game():
 def online_next_round():
     room_id = request.json.get('room_id')
     player_id = session.get('player_id')
-    
+
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if not room or player_id != room['host_id']:
@@ -688,22 +696,22 @@ def online_reveal_role():
     room_id = request.json.get('room_id')
     target_id = request.json.get('target_id')
     player_id = session.get('player_id')
-    
+
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if not room or room['phase'] != 'ROLE_REVEAL':
             return jsonify({'error': 'Invalid phase'}), 400
-        
+
         target_player = room['players'].get(target_id)
         if not target_player:
             return jsonify({'error': 'Invalid target'}), 400
-            
+
         if target_id != player_id and target_player.get('device_id') != player_id:
             return jsonify({'error': 'Unauthorized to reveal this role'}), 403
-            
+
         if target_id in room.get('revealed_players', set()):
             return jsonify({'error': 'Already revealed'}), 400
-            
+
         room['revealed_players'].add(target_id)
         return jsonify({
             'is_chameleon': (room['roles'][target_id] == 'CHAMELEON'),
@@ -714,15 +722,15 @@ def online_reveal_role():
 @app.route('/online/player_done', methods=['POST'])
 def online_player_done():
     room_id = request.json.get('room_id')
-    
+
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if not room: return jsonify({'success': False})
-        
+
         if len(room['revealed_players']) >= len(room['players']):
             room['phase'] = 'PLAYING'
             log_room_action(room, "🎭 Everyone revealed their roles. Phase transitioned to Playing.")
-            
+
     return jsonify({'success': True})
 
 @app.route('/online/verify_code', methods=['POST'])
@@ -730,12 +738,12 @@ def online_verify_code():
     data = request.json
     room_id = data.get('room_id')
     player_id = session.get('player_id')
-    
+
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if not room:
             return jsonify({'valid': False})
-        
+
         if room.get('use_codes', True):
             code = str(data.get('code', '')).strip()
             for pid, expected_code in room['player_codes'].items():
@@ -750,10 +758,10 @@ def online_verify_code():
             tgt_player = room['players'].get(tgt)
             if not tgt_player:
                 return jsonify({'valid': False})
-                
+
             if tgt != player_id and tgt_player.get('device_id') != player_id:
                 return jsonify({'valid': False})
-                
+
             is_cham = (room['roles'][tgt] == 'CHAMELEON')
             return jsonify({'valid': True, 'is_chameleon': is_cham, 'col': room['col'], 'row': room['row']})
 
@@ -764,18 +772,18 @@ def online_change_topic():
     req_type = data.get('type')
     topic_name = data.get('topic')
     player_id = session.get('player_id')
-    
+
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if not room:
             return jsonify({'error': 'Room not found'}), 404
-            
+
         if room['host_id'] != player_id:
             return jsonify({'error': 'Only the host can change the topic'}), 403
-        
+
         if req_type == 'random' or not topic_name or topic_name not in TOPIC_CARDS:
             topic_name = random.choice(list(TOPIC_CARDS.keys()))
-        
+
         room['topic_name'] = topic_name
         room['grid'] = TOPIC_CARDS[topic_name]
         # FIX: regenerate col/row and set secret_word accordingly
@@ -789,7 +797,7 @@ def online_change_topic():
 @app.route('/online/start_voting_phase', methods=['POST'])
 def online_start_voting():
     room_id = request.json.get('room_id')
-    
+
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if room:
@@ -804,30 +812,30 @@ def online_cast_vote():
     voter_id = data.get('voter_id')
     target_id = data.get('target_id')
     player_id = session.get('player_id')
-    
+
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
         if not room:
             return jsonify({'error': 'Room not found'}), 404
-            
+
         voter_player = room['players'].get(voter_id)
         if not voter_player:
             return jsonify({'error': 'Invalid voter'}), 400
-            
+
         if voter_id != player_id and voter_player.get('device_id') != player_id:
             return jsonify({'error': 'Unauthorized to cast this vote'}), 403
-        
+
         if voter_id in room['votes']:
             return jsonify({'error': 'Already voted'}), 400
-        
+
         if target_id not in room['players']:
             return jsonify({'error': 'Invalid target'}), 400
-        
+
         room['votes'][voter_id] = target_id
         if len(room['votes']) >= len(room['players']):
             room['phase'] = 'RESULTS'
             log_room_action(room, "🗳️ All votes cast, moving to results.")
-    
+
     return jsonify({'success': True})
 
 @app.route('/online/end_voting', methods=['POST'])
@@ -867,10 +875,10 @@ def online_bluff_action():
     action = data.get('action')
     room_id = data.get('room_id')
     pid = session['player_id']
-    
+
     with ROOMS_LOCK:
         room = ROOMS.get(room_id)
-        if not room or room['game_type'] != 'bluff': 
+        if not room or room['game_type'] != 'bluff':
             return jsonify({'error': 'Invalid state'}), 400
 
         if action == 'play_cards':
@@ -878,25 +886,25 @@ def online_bluff_action():
                 return jsonify({'error': 'Not your turn'})
             if room.get('played_by') is not None:
                 return jsonify({'error': 'Already a play pending'})
-                
+
             indices = data.get('indices', [])
             rank = data.get('rank', '')
             if not indices or not rank:
                 return jsonify({'error': 'Select cards and rank'})
-            
+
             hand = room['players'][pid]['cards']
             if max(indices) >= len(hand) or min(indices) < 0:
                 return jsonify({'error': 'Invalid card indices'})
-            
+
             played = [hand[i] for i in sorted(indices, reverse=True)]
             for i in sorted(indices, reverse=True): del hand[i]
-            
+
             room['played_cards'] = played
-            room['last_played_cards'] = played  
+            room['last_played_cards'] = played
             room['claimed_rank'] = rank
             room['played_by'] = pid
             room['consecutive_passes'] = 0
-            
+
             log_room_action(room, f"🃏 {room['players'][pid]['name']} started pile with {len(played)} card(s), claiming {rank}s")
             next_bluff_turn(room)
             return jsonify({'success': True})
@@ -906,23 +914,23 @@ def online_bluff_action():
                 return jsonify({'error': 'Not your turn'})
             if room.get('played_by') is None:
                 return jsonify({'error': 'No claim to follow'})
-                
+
             indices = data.get('indices', [])
             if not indices:
                 return jsonify({'error': 'Select cards to play'})
-            
+
             hand = room['players'][pid]['cards']
             if max(indices) >= len(hand) or min(indices) < 0:
                 return jsonify({'error': 'Invalid card indices'})
-            
+
             played = [hand[i] for i in sorted(indices, reverse=True)]
             for i in sorted(indices, reverse=True): del hand[i]
-            
+
             room['played_cards'].extend(played)
-            room['last_played_cards'] = played  
-            room['played_by'] = pid             
+            room['last_played_cards'] = played
+            room['played_by'] = pid
             room['consecutive_passes'] = 0
-            
+
             log_room_action(room, f"➕ {room['players'][pid]['name']} added {len(played)} card(s) to the pile")
             next_bluff_turn(room)
             return jsonify({'success': True})
@@ -930,52 +938,52 @@ def online_bluff_action():
         elif action == 'call_bluff':
             if room['phase'] != 'BLUFF_PLAYING' or pid != room['turn_order'][room['current_turn_index']]:
                 return jsonify({'error': 'Not your turn'})
-                
+
             played_by = room.get('played_by')
             if not played_by or played_by == pid:
                 return jsonify({'error': 'Invalid call'})
-                
+
             is_true = all(rank_of(c) == room['claimed_rank'] for c in room.get('last_played_cards', []))
             room['consecutive_passes'] = 0
-            
+
             log_room_action(room, f"🚨 {room['players'][pid]['name']} called bluff on {room['players'][played_by]['name']}!")
-            
+
             if is_true:
                 pick_up, turn_to = pid, played_by
                 log_room_action(room, f"✔️ TRUE! {room['players'][played_by]['name']} told the truth. {room['players'][pid]['name']} picks up pile.")
             else:
                 pick_up, turn_to = played_by, pid
                 log_room_action(room, f"❌ FALSE! {room['players'][played_by]['name']} lied. {room['players'][played_by]['name']} picks up pile.")
-                
+
             cards = room['discard_pile'] + room['played_cards']
             room['players'][pick_up]['cards'].extend(cards)
-            
+
             room['discard_pile'] = []
             room['played_cards'] = []
             room['last_played_cards'] = []
             room['claimed_rank'] = ''
             room['played_by'] = None
-            
+
             if turn_to in room['turn_order']:
                 room['current_turn_index'] = room['turn_order'].index(turn_to)
             else:
                 next_bluff_turn(room)
-                
+
             return jsonify({'success': True})
 
         elif action == 'pass_bluff':
             if room['phase'] != 'BLUFF_PLAYING' or pid != room['turn_order'][room['current_turn_index']]:
                 return jsonify({'error': 'Not your turn'})
-                
+
             played_by = room.get('played_by')
             if not played_by:
                 return jsonify({'error': 'Nothing to pass on'})
-                
+
             room['consecutive_passes'] = room.get('consecutive_passes', 0) + 1
             log_room_action(room, f"⏭️ {room['players'][pid]['name']} passed.")
-            
+
             active_count = len([p for p in room['turn_order'] if len(room['players'][p]['cards']) > 0])
-            
+
             if room['consecutive_passes'] >= active_count - 1:
                 room['discard_pile'].extend(room['played_cards'])
                 room['played_cards'] = []
@@ -983,7 +991,7 @@ def online_bluff_action():
                 room['claimed_rank'] = ''
                 room['played_by'] = None
                 room['consecutive_passes'] = 0
-                
+
                 if played_by in room['turn_order'] and len(room['players'][played_by]['cards']) == 0:
                     room['turn_order'].remove(played_by)
                     log_room_action(room, f"💀 {room['players'][played_by]['name']} is eliminated (no cards left)")
@@ -994,7 +1002,7 @@ def online_bluff_action():
                         room['current_turn_index'] = room['turn_order'].index(played_by)
             else:
                 next_bluff_turn(room)
-                
+
             return jsonify({'success': True})
 
     return jsonify({'error': 'Unknown action'}), 400
@@ -1061,6 +1069,8 @@ HTML_TEMPLATE = r"""
         #chat-input-row button { background: var(--accent); color: white; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer; }
         .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: #334155; color: white; padding: 12px 20px; border-radius: 8px; z-index: 2000; animation: slideDown 0.3s ease; }
         @keyframes slideDown { from { opacity: 0; transform: translate(-50%, -20px); } to { opacity: 1; transform: translate(-50%, 0); } }
+        .chat-notification { position: fixed; bottom: 90px; right: 90px; background: #1e293b; color: var(--text); padding: 10px 14px; border-radius: 12px; border-left: 4px solid var(--accent); z-index: 1999; max-width: 250px; text-align: left; font-size: 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); animation: slideUp 0.3s ease; }
+        @keyframes slideUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
         .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 1500; display: flex; align-items: center; justify-content: center; }
         .modal-content { background: var(--card-bg); border-radius: 16px; padding: 20px; max-width: 400px; width: 90%; max-height: 80vh; overflow-y: auto; }
         .topic-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0; }
@@ -1114,7 +1124,8 @@ HTML_TEMPLATE = r"""
             <div id="local-result-alert" class="alert-box"></div>
             <button class="btn" onclick="resetLocalGrid()" style="margin-top:15px;">🔒 Hide</button>
         </div>
-        <button class="btn" style="background:#475569; margin-top:20px;" onclick="goToLanding()">🏠 End Game</button>
+        <button class="btn btn-warning" style="margin-top:20px;" onclick="revealLocalChameleon()">👤 Reveal Chameleon</button>
+        <button class="btn" style="background:#475569; margin-top:10px;" onclick="goToLanding()">🏠 End Game</button>
     </div>
 
     <div id="screen-online-start" class="screen">
@@ -1241,6 +1252,14 @@ function showToast(message) {
     setTimeout(() => toast.remove(), 3000);
 }
 
+function showChatNotification(username, text) {
+    const notif = document.createElement('div');
+    notif.className = 'chat-notification';
+    notif.innerHTML = `<strong>${username}:</strong> ${text}`;
+    document.body.appendChild(notif);
+    setTimeout(() => notif.remove(), 4000);
+}
+
 function toggleChat() {
     chatVisible = !chatVisible;
     document.getElementById('chat-container').classList.toggle('open', chatVisible);
@@ -1268,12 +1287,19 @@ function loadChat() {
         const container = document.getElementById('chat-messages');
         container.innerHTML = messages.map(m => `<div class="chat-msg"><span class="username">${m.username}</span><span class="text">${m.text}</span><span class="time">${m.time}</span></div>`).join('');
         container.scrollTop = container.scrollHeight;
-        if (!chatVisible && messages.length > lastMsgCount) {
-            chatUnread += (messages.length - lastMsgCount);
-            const badge = document.getElementById('chat-badge');
-            badge.style.display = 'flex';
-            badge.textContent = chatUnread;
-            badge.classList.add('pulse-anim');
+        // Check for new messages and show notification
+        if (messages.length > lastMsgCount) {
+            const newMessages = messages.slice(lastMsgCount);
+            newMessages.forEach(msg => {
+                showChatNotification(msg.username, msg.text);
+            });
+            if (!chatVisible) {
+                chatUnread += newMessages.length;
+                const badge = document.getElementById('chat-badge');
+                badge.style.display = 'flex';
+                badge.textContent = chatUnread;
+                badge.classList.add('pulse-anim');
+            }
         }
         lastMsgCount = messages.length;
     });
@@ -1350,6 +1376,19 @@ function resetLocalGrid() {
     else document.getElementById('local-no-code-area').style.display = 'block';
     document.getElementById('local-player-code-input').value = '';
     renderGrid('local-grid-table', null, null);
+}
+function revealLocalChameleon() {
+    fetch('/local/get_chameleon', { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                showToast(data.error);
+                return;
+            }
+            const alertBox = document.getElementById('local-result-alert');
+            alertBox.innerHTML = `The Chameleon was <span style="color:var(--warning)">${data.chameleon_name}</span>`;
+            document.getElementById('local-decrypted-info').style.display = 'block';
+        });
 }
 function pollLocalState() {
     fetch('/local/state', { method: 'POST' }).then(r => r.json()).then(data => {
@@ -1901,5 +1940,6 @@ function bluffAction(act) {
 """
 
 if __name__ == '__main__':
+    # For production on Render, debug should be False
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
-    app.run(debug=debug_mode, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=debug_mode)
