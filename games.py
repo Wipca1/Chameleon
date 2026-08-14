@@ -1,4 +1,4 @@
-# app.py – Unified Chameleon + Bluff (Complete Fixed Version)
+# app.py – Unified Chameleon + Bluff (Complete Fixed Version with 3-Player Option)
 from flask import Flask, render_template_string, jsonify, request, session
 import random
 import string
@@ -91,7 +91,7 @@ GAME_STATE_LOCK = threading.RLock()
 # ---------- LOCAL (Pass & Play) ----------
 game_state = {
     'phase': 'START_SCREEN',
-    'players_count': 4,
+    'players_count': 3,
     'current_player_idx': 0,
     'roles': [],
     'player_codes': {},
@@ -157,13 +157,19 @@ def setup_new_online_round(room, category=None):
     room['chameleon_id'] = chameleon_id
     for pid in player_ids:
         room['roles'][pid] = 'CHAMELEON' if pid == chameleon_id else 'CLUED_IN'
-    
+
     if not category or category not in TOPIC_CARDS:
         category = random.choice(list(TOPIC_CARDS.keys()))
     grid = TOPIC_CARDS[category]
     room['topic_name'] = category
     room['grid'] = grid
-    room['secret_word'] = random.choice([word for row in grid for word in row])
+
+    # FIX: select col/row first, then derive secret_word from that coordinate
+    room['col'], room['row'] = get_random_coordinates()
+    col_idx = ord(room['col']) - ord('A')
+    row_idx = room['row'] - 1
+    room['secret_word'] = grid[row_idx][col_idx]
+
     shared_clued_code = str(random.randint(0, 9))
     while True:
         chameleon_code = str(random.randint(0, 9))
@@ -172,7 +178,6 @@ def setup_new_online_round(room, category=None):
     room['player_codes'] = {}
     for pid in player_ids:
         room['player_codes'][pid] = chameleon_code if room['roles'][pid] == 'CHAMELEON' else shared_clued_code
-    room['col'], room['row'] = get_random_coordinates()
     room['revealed_players'] = set()
     room['phase'] = 'ROLE_REVEAL'
 
@@ -185,7 +190,7 @@ def start_bluff_round(room):
     hands = deal_cards(deck, len(players))
     for i, pid in enumerate(players):
         room['players'][pid]['cards'] = hands[i]
-    
+
     room['discard_pile'] = []
     room['played_cards'] = []
     room['last_played_cards'] = []
@@ -260,7 +265,7 @@ def local_state():
 @app.route('/local/start_game', methods=['POST'])
 def local_start_game():
     data = request.json or {}
-    players_count = int(data.get('players_count', 4))
+    players_count = int(data.get('players_count', 3))
     use_codes = data.get('use_codes', True)
     
     with GAME_STATE_LOCK:
@@ -288,6 +293,7 @@ def local_start_game():
         topic_name, grid = random.choice(list(TOPIC_CARDS.items()))
         game_state['topic_name'] = topic_name
         game_state['grid'] = grid
+        # For local, we don't need secret_word separately; it's derived from grid and coordinates.
         game_state['phase'] = 'ROLES' if use_codes else 'PUBLIC_GRID'
     return jsonify({'success': True})
 
@@ -595,7 +601,8 @@ def online_room_state():
                 'secret_word': room['secret_word'] if room['phase'] == 'RESULTS' else None,
                 'vote_results': [],
                 'use_codes': room.get('use_codes', True),
-                'device_players': device_players
+                'device_players': device_players,
+                'chameleon_caught': None
             })
             
             if room['phase'] == 'RESULTS':
@@ -604,6 +611,17 @@ def online_room_state():
                     if target in counts: counts[target] += 1
                 for pid, cnt in counts.items():
                     response['vote_results'].append({'name': room['players'][pid]['name'], 'count': cnt})
+                
+                # Determine if chameleon was caught
+                if counts:
+                    max_votes = max(counts.values())
+                    # If there's a tie, chameleon is not caught (standard rule)
+                    if max_votes > 0 and counts.get(room['chameleon_id'], 0) == max_votes:
+                        response['chameleon_caught'] = True
+                    else:
+                        response['chameleon_caught'] = False
+                else:
+                    response['chameleon_caught'] = False
 
             if room['phase'] == 'ROLE_REVEAL':
                 unrevealed = [p for p in device_players if p['id'] not in room.get('revealed_players', set())]
@@ -760,8 +778,11 @@ def online_change_topic():
         
         room['topic_name'] = topic_name
         room['grid'] = TOPIC_CARDS[topic_name]
-        room['secret_word'] = random.choice([word for row in room['grid'] for word in row])
+        # FIX: regenerate col/row and set secret_word accordingly
         room['col'], room['row'] = get_random_coordinates()
+        col_idx = ord(room['col']) - ord('A')
+        row_idx = room['row'] - 1
+        room['secret_word'] = room['grid'][row_idx][col_idx]
         log_room_action(room, f"🔄 Topic changed to {topic_name}")
     return jsonify({'success': True})
 
@@ -805,6 +826,7 @@ def online_cast_vote():
         room['votes'][voter_id] = target_id
         if len(room['votes']) >= len(room['players']):
             room['phase'] = 'RESULTS'
+            log_room_action(room, "🗳️ All votes cast, moving to results.")
     
     return jsonify({'success': True})
 
@@ -815,6 +837,7 @@ def online_end_voting():
         room = ROOMS.get(room_id)
         if room:
             room['phase'] = 'RESULTS'
+            log_room_action(room, "🗳️ Voting ended by host.")
     return jsonify({'success': True})
 
 @app.route('/online/restart', methods=['POST'])
@@ -977,7 +1000,7 @@ def online_bluff_action():
     return jsonify({'error': 'Unknown action'}), 400
 
 # ---------- HTML TEMPLATE ----------
-HTML_TEMPLATE = """
+HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1004,7 +1027,7 @@ HTML_TEMPLATE = """
         .badge { display: inline-block; background: #334155; padding: 4px 12px; border-radius: 20px; font-size: 14px; color: var(--accent); margin-bottom: 12px; font-weight: bold; }
         .screen { display: none; }
         .active-screen { display: block; }
-        .player-selector { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 15px 0; }
+        .player-selector { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 15px 0; }
         .player-option { background: #334155; padding: 12px; border-radius: 10px; cursor: pointer; font-weight: bold; border: 2px solid transparent; transition: all 0.2s; }
         .player-option.selected { border-color: var(--accent); background: rgba(6, 182, 212, 0.2); color: var(--accent); }
         table { width: 100%; border-collapse: separate; border-spacing: 6px; margin-top: 15px; }
@@ -1058,7 +1081,8 @@ HTML_TEMPLATE = """
     <div id="screen-local-start" class="screen">
         <p style="color: var(--text-muted);">Number of Players:</p>
         <div class="player-selector" id="local-player-grid">
-            <div class="player-option p-opt selected" onclick="selectLocalPlayers(4)">4</div>
+            <div class="player-option p-opt selected" onclick="selectLocalPlayers(3)">3</div>
+            <div class="player-option p-opt" onclick="selectLocalPlayers(4)">4</div>
             <div class="player-option p-opt" onclick="selectLocalPlayers(5)">5</div>
             <div class="player-option p-opt" onclick="selectLocalPlayers(6)">6</div>
         </div>
@@ -1080,6 +1104,7 @@ HTML_TEMPLATE = """
     <div id="screen-local-grid" class="screen">
         <h3 id="local-topic-title" style="color: var(--warning);"></h3>
         <button class="btn btn-topic" onclick="openTopicModal('local')">🔀 Change Topic</button>
+        <table id="local-grid-table"></table>
         <div style="margin-top:15px;">
             <div id="local-code-input-area"><input type="text" id="local-player-code-input" placeholder="Enter Secret Code"/></div>
             <div id="local-no-code-area" style="display:none;"><select id="local-viewer-select"></select></div>
@@ -1087,7 +1112,6 @@ HTML_TEMPLATE = """
         </div>
         <div id="local-decrypted-info" style="display:none; margin-top:20px;">
             <div id="local-result-alert" class="alert-box"></div>
-            <table id="local-grid-table"></table>
             <button class="btn" onclick="resetLocalGrid()" style="margin-top:15px;">🔒 Hide</button>
         </div>
         <button class="btn" style="background:#475569; margin-top:20px;" onclick="goToLanding()">🏠 End Game</button>
@@ -1193,6 +1217,22 @@ HTML_TEMPLATE = """
 </div>
 
 <script>
+// Global state for UI preservation
+let onlineSecretRevealed = false;
+let onlineRevealedData = null;
+let localSecretRevealed = false;
+let localRevealedData = null;
+
+// Track dropdown states
+let voteAsSelectValue = '';
+let onlineViewerSelectValue = '';
+let localViewerSelectValue = '';
+let onlineGameTypeValue = '';
+let manualDeviceAssignValue = '';
+
+// Chat
+let chatVisible = false, chatUnread = 0, chatUsername = localStorage.getItem('chatUsername') || '', lastMsgCount = 0;
+
 function showToast(message) {
     const toast = document.createElement('div');
     toast.className = 'toast';
@@ -1201,7 +1241,6 @@ function showToast(message) {
     setTimeout(() => toast.remove(), 3000);
 }
 
-let chatVisible = false, chatUnread = 0, chatUsername = localStorage.getItem('chatUsername') || '', lastMsgCount = 0;
 function toggleChat() {
     chatVisible = !chatVisible;
     document.getElementById('chat-container').classList.toggle('open', chatVisible);
@@ -1266,7 +1305,8 @@ function showRules() {
     document.body.insertAdjacentHTML('beforeend', rules);
 }
 
-let localPlayers = 4, localUseCodes = true;
+// Local game state
+let localPlayers = 3, localUseCodes = true;
 function selectLocalPlayers(num) { localPlayers = num; document.querySelectorAll('#local-player-grid .p-opt').forEach(el => el.classList.toggle('selected', parseInt(el.innerText) === num)); }
 function toggleLocalCodes() {
     localUseCodes = !localUseCodes;
@@ -1288,6 +1328,8 @@ function verifyLocalCode() {
     let payload = localUseCodes ? { code: document.getElementById('local-player-code-input').value } : { player_idx: document.getElementById('local-viewer-select').value };
     fetch('/local/verify_code', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) }).then(r => r.json()).then(data => {
         if (!data.valid) { showToast("Invalid selection/code."); return; }
+        localSecretRevealed = true;
+        localRevealedData = data;
         document.getElementById('local-code-input-area').style.display = 'none';
         document.getElementById('local-no-code-area').style.display = 'none';
         document.getElementById('local-decrypted-info').style.display = 'block';
@@ -1301,15 +1343,20 @@ function verifyLocalCode() {
     });
 }
 function resetLocalGrid() {
+    localSecretRevealed = false;
+    localRevealedData = null;
     document.getElementById('local-decrypted-info').style.display = 'none';
     if(localUseCodes) document.getElementById('local-code-input-area').style.display = 'block';
     else document.getElementById('local-no-code-area').style.display = 'block';
     document.getElementById('local-player-code-input').value = '';
+    renderGrid('local-grid-table', null, null);
 }
 function pollLocalState() {
     fetch('/local/state', { method: 'POST' }).then(r => r.json()).then(data => {
         localUseCodes = data.use_codes;
         if (data.phase === 'ROLES') {
+            localSecretRevealed = false;
+            localRevealedData = null;
             showScreen('screen-local-roles');
             document.getElementById('local-player-turn-header').innerText = `Player ${data.current_player_idx + 1}'s Turn`;
             document.getElementById('local-reveal-role-btn').style.display = 'block';
@@ -1318,11 +1365,43 @@ function pollLocalState() {
             showScreen('screen-local-grid');
             document.getElementById('local-topic-title').innerText = data.topic_name;
             window.currentGrid = data.grid;
-            if (localUseCodes) { document.getElementById('local-code-input-area').style.display = 'block'; document.getElementById('local-no-code-area').style.display = 'none'; }
-            else {
+            // Always render grid
+            if (localRevealedData && !localRevealedData.is_chameleon) {
+                renderGrid('local-grid-table', localRevealedData.col, localRevealedData.row);
+            } else {
+                renderGrid('local-grid-table', null, null);
+            }
+            // Preserve reveal state
+            if (localSecretRevealed && localRevealedData) {
                 document.getElementById('local-code-input-area').style.display = 'none';
-                document.getElementById('local-no-code-area').style.display = 'block';
-                document.getElementById('local-viewer-select').innerHTML = Array.from({length: data.players_count}, (_,i) => `<option value="${i}">Player ${i+1}</option>`).join('');
+                document.getElementById('local-no-code-area').style.display = 'none';
+                document.getElementById('local-decrypted-info').style.display = 'block';
+                if (localRevealedData.is_chameleon) {
+                    document.getElementById('local-result-alert').innerHTML = 'You are the <span style="color:var(--warning)">CHAMELEON</span>. Blend in!';
+                } else {
+                    document.getElementById('local-result-alert').innerHTML = `Target: <span style="color:var(--accent)">${localRevealedData.col}${localRevealedData.row}</span>`;
+                }
+            } else {
+                if (localUseCodes) { 
+                    document.getElementById('local-code-input-area').style.display = 'block'; 
+                    document.getElementById('local-no-code-area').style.display = 'none'; 
+                } else {
+                    document.getElementById('local-code-input-area').style.display = 'none';
+                    document.getElementById('local-no-code-area').style.display = 'block';
+                    const viewerSelect = document.getElementById('local-viewer-select');
+                    if (viewerSelect) {
+                        const currentValue = viewerSelect.value || localViewerSelectValue;
+                        viewerSelect.innerHTML = Array.from({length: data.players_count}, (_,i) => `<option value="${i}">Player ${i+1}</option>`).join('');
+                        if (currentValue !== '') {
+                            viewerSelect.value = currentValue;
+                            localViewerSelectValue = currentValue;
+                        }
+                    }
+                }
+                document.getElementById('local-decrypted-info').style.display = 'none';
+                if (!document.activeElement || document.activeElement.id !== 'local-player-code-input') {
+                    document.getElementById('local-player-code-input').value = '';
+                }
             }
         }
     });
@@ -1342,6 +1421,7 @@ function renderGrid(tableId, targetCol, targetRow) {
     document.getElementById(tableId).innerHTML = html;
 }
 
+// Topic modal
 function openTopicModal(prefix) {
     const topicNames = {{ topics|tojson }};
     const modal = document.createElement('div');
@@ -1375,6 +1455,7 @@ function changeTopic(prefix, type) {
         });
 }
 
+// Online
 let currentRoom = null, isHost = false, myPlayerId = null, pollInterval = null;
 let selectedBluffCards = [];
 window.currentRevealId = null;
@@ -1414,7 +1495,10 @@ function startOnlinePoll() {
     onlinePollState();
 }
 
-function setGamemode(type) { fetch('/online/set_game', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom, game_type: type}) }); }
+function setGamemode(type) { 
+    onlineGameTypeValue = type;
+    fetch('/online/set_game', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom, game_type: type}) }); 
+}
 function requestGamemode(type) { fetch('/online/request_gamemode', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom, mode: type}) }); }
 function toggleOnlineCodes() { fetch('/online/toggle_codes', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom, use_codes: !window.onlineUseCodes}) }); }
 function kickPlayer(pid) { fetch('/online/remove_player', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom, player_id: pid}) }); }
@@ -1445,6 +1529,15 @@ function updateElementIfChanged(element, newHtml) {
     return false;
 }
 
+// Prevent dropdown reset
+document.addEventListener('change', function(e) {
+    if (e.target.id === 'online-game-type') onlineGameTypeValue = e.target.value;
+    else if (e.target.id === 'vote-as-select') voteAsSelectValue = e.target.value;
+    else if (e.target.id === 'online-viewer-select') onlineViewerSelectValue = e.target.value;
+    else if (e.target.id === 'local-viewer-select') localViewerSelectValue = e.target.value;
+    else if (e.target.id === 'manual-device-assign') manualDeviceAssignValue = e.target.value;
+});
+
 function onlinePollState() {
     fetch(`/online/room_state?room=${currentRoom}`).then(r => r.json()).then(data => {
         if (data.error) { goToLanding(); return; }
@@ -1453,6 +1546,8 @@ function onlinePollState() {
         window.onlineUseCodes = data.use_codes;
 
         if (data.phase === 'LOBBY') {
+            onlineSecretRevealed = false;
+            onlineRevealedData = null;
             roleRevealed = false;
             updateLogBox('online-game-log', data.game_log);
             showScreen('screen-online-lobby');
@@ -1461,7 +1556,15 @@ function onlinePollState() {
             document.getElementById('btn-start-online').style.display = isHost ? 'block' : 'none';
             document.getElementById('online-wait-msg').style.display = isHost ? 'none' : 'block';
             document.getElementById('btn-disband-room').style.display = isHost ? 'block' : 'none';
-            if (isHost) document.getElementById('online-game-type').value = data.game_type;
+            if (isHost) {
+                const gameTypeSelect = document.getElementById('online-game-type');
+                if (gameTypeSelect && onlineGameTypeValue) {
+                    gameTypeSelect.value = onlineGameTypeValue;
+                } else if (gameTypeSelect) {
+                    gameTypeSelect.value = data.game_type;
+                    onlineGameTypeValue = data.game_type;
+                }
+            }
 
             if (data.game_type === 'bluff') {
                 document.getElementById('chameleon-lobby-features').style.display = 'none';
@@ -1474,9 +1577,14 @@ function onlinePollState() {
                 if (isHost) {
                     const onlinePlayers = data.players.filter(p => !p.is_manual);
                     const devSelect = document.getElementById('manual-device-assign');
-                    const currentDev = devSelect.value;
-                    devSelect.innerHTML = onlinePlayers.map(p => `<option value="${p.id}">${p.name}'s Device</option>`).join('');
-                    if (currentDev && onlinePlayers.some(p => p.id === currentDev)) devSelect.value = currentDev;
+                    if (devSelect) {
+                        const currentDev = devSelect.value || manualDeviceAssignValue;
+                        devSelect.innerHTML = onlinePlayers.map(p => `<option value="${p.id}">${p.name}'s Device</option>`).join('');
+                        if (currentDev && onlinePlayers.some(p => p.id === currentDev)) {
+                            devSelect.value = currentDev;
+                            manualDeviceAssignValue = currentDev;
+                        }
+                    }
                 }
                 
                 const btnCodes = document.getElementById('btn-online-toggle-codes');
@@ -1492,6 +1600,8 @@ function onlinePollState() {
             }
         } 
         else if (data.phase.startsWith('BLUFF_')) {
+            onlineSecretRevealed = false;
+            onlineRevealedData = null;
             roleRevealed = false;
             showScreen('screen-online-bluff');
             updateLogBox('bluff-game-log', data.game_log);
@@ -1499,6 +1609,8 @@ function onlinePollState() {
         }
         else {
             if (data.phase === 'ROLE_REVEAL') {
+                onlineSecretRevealed = false;
+                onlineRevealedData = null;
                 showScreen('screen-online-roles');
                 
                 if (!roleRevealed && !data.already_revealed) {
@@ -1520,29 +1632,77 @@ function onlinePollState() {
                 updateLogBox('online-chameleon-log', data.game_log);
                 document.getElementById('online-topic-title').innerText = data.topic_name;
                 window.currentGrid = data.grid;
-                renderGrid('online-grid-table', null, null);
+                
+                // Always render grid
+                if (onlineRevealedData && !onlineRevealedData.is_chameleon) {
+                    renderGrid('online-grid-table', onlineRevealedData.col, onlineRevealedData.row);
+                } else {
+                    renderGrid('online-grid-table', null, null);
+                }
+                
                 document.getElementById('btn-online-change-topic').style.display = isHost ? 'inline-block' : 'none';
                 document.getElementById('btn-start-voting').style.display = isHost ? 'inline-block' : 'none';
                 
-                document.getElementById('online-code-input-area').style.display = data.use_codes ? 'block' : 'none';
-                document.getElementById('online-no-code-area').style.display = !data.use_codes ? 'block' : 'none';
-                if (!data.use_codes) {
-                    document.getElementById('online-viewer-select').innerHTML = data.device_players.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+                // Preserve secret reveal state
+                if (onlineSecretRevealed && onlineRevealedData) {
+                    document.getElementById('online-code-input-area').style.display = 'none';
+                    document.getElementById('online-no-code-area').style.display = 'none';
+                    document.getElementById('online-decrypted-info').style.display = 'block';
+                    if (onlineRevealedData.is_chameleon) {
+                        document.getElementById('online-result-alert').innerHTML = 'You are the <span style="color:var(--warning)">CHAMELEON</span>.';
+                    } else {
+                        document.getElementById('online-result-alert').innerHTML = `Target: <span style="color:var(--accent)">${onlineRevealedData.col}${onlineRevealedData.row}</span>`;
+                    }
+                } else {
+                    document.getElementById('online-code-input-area').style.display = data.use_codes ? 'block' : 'none';
+                    document.getElementById('online-no-code-area').style.display = !data.use_codes ? 'block' : 'none';
+                    if (!data.use_codes) {
+                        const viewerSelect = document.getElementById('online-viewer-select');
+                        if (viewerSelect) {
+                            const currentValue = viewerSelect.value || onlineViewerSelectValue;
+                            viewerSelect.innerHTML = data.device_players.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+                            if (currentValue && data.device_players.some(p => p.id === currentValue)) {
+                                viewerSelect.value = currentValue;
+                                onlineViewerSelectValue = currentValue;
+                            }
+                        }
+                    }
+                    document.getElementById('online-decrypted-info').style.display = 'none';
+                    if (!document.activeElement || document.activeElement.id !== 'online-player-code-input') {
+                        document.getElementById('online-player-code-input').value = '';
+                    }
                 }
-                document.getElementById('online-decrypted-info').style.display = 'none';
-                document.getElementById('online-player-code-input').value = '';
             } else if (data.phase === 'VOTING') {
+                onlineSecretRevealed = false;
+                onlineRevealedData = null;
                 roleRevealed = false;
                 showScreen('screen-online-voting');
-                document.getElementById('vote-as-select').innerHTML = data.device_players.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+                
+                // Preserve vote dropdown
+                const voteAsSelect = document.getElementById('vote-as-select');
+                if (voteAsSelect) {
+                    const currentVote = voteAsSelect.value || voteAsSelectValue;
+                    voteAsSelect.innerHTML = data.device_players.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+                    if (currentVote && data.device_players.some(p => p.id === currentVote)) {
+                        voteAsSelect.value = currentVote;
+                        voteAsSelectValue = currentVote;
+                    }
+                }
+                
                 document.getElementById('vote-targets').innerHTML = data.players.map(p => `<button class="btn btn-option" onclick="castOnlineVote('${p.id}')">${p.name}</button>`).join('');
                 document.getElementById('btn-end-voting').style.display = isHost ? 'block' : 'none';
                 document.getElementById('vote-as-select').style.display = 'block';
             } else if (data.phase === 'RESULTS') {
+                onlineSecretRevealed = false;
+                onlineRevealedData = null;
                 roleRevealed = false;
                 showScreen('screen-online-voting');
                 let html = `<h3 style="color:var(--success);">Word: ${data.secret_word}</h3>`;
                 html += `<h4 style="color:var(--warning);">Chameleon: ${data.chameleon_name}</h4>`;
+                if (data.chameleon_caught !== null) {
+                    const resultText = data.chameleon_caught ? 'The Chameleon was caught!' : 'The Chameleon escaped!';
+                    html += `<p style="font-size:18px; font-weight:bold;">${resultText}</p>`;
+                }
                 html += `<div>${data.vote_results.map(v => `<p>${v.name}: ${v.count} votes</p>`).join('')}</div>`;
                 if (isHost) {
                     html += `<button class="btn btn-start" onclick="nextRound()">🔄 Play Again</button>`;
@@ -1582,6 +1742,8 @@ function verifyOnlineCode() {
     }
     fetch('/online/verify_code', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) }).then(r=>r.json()).then(data => {
         if (!data.valid) { showToast("Invalid code or unauthorized."); return; }
+        onlineSecretRevealed = true;
+        onlineRevealedData = data;
         document.getElementById('online-code-input-area').style.display = 'none';
         document.getElementById('online-no-code-area').style.display = 'none';
         document.getElementById('online-decrypted-info').style.display = 'block';
@@ -1596,6 +1758,8 @@ function verifyOnlineCode() {
 }
 
 function resetOnlineGrid() {
+    onlineSecretRevealed = false;
+    onlineRevealedData = null;
     document.getElementById('online-decrypted-info').style.display = 'none';
     if (window.onlineUseCodes) {
         document.getElementById('online-code-input-area').style.display = 'block';
@@ -1613,6 +1777,7 @@ function castOnlineVote(targetId) {
 }
 function endOnlineVoting() { fetch('/online/end_voting', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({room_id: currentRoom}) }); }
 
+// Bluff rendering
 function renderBluffGame(data) {
     const isMyTurn = (data.current_player === myPlayerId);
     const currentHandLength = data.your_hand ? data.your_hand.length : 0;
